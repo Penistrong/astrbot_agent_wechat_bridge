@@ -1,19 +1,36 @@
-"""访问控制与文本归一化辅助函数。"""
+"""访问控制、会话分类与文本归一化辅助函数。"""
 
 from __future__ import annotations
 
 import re
+from typing import Any
 
 DM_POLICIES = {"open", "allowlist", "disabled"}
 GROUP_POLICIES = {"open", "allowlist", "disabled"}
 INVISIBLE_TEXT_RE = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u206f]")
 MENTION_SPLIT_RE = re.compile(r"[\u2005\s]+")
 
+SYSTEM_PEER_IDS = {
+    "weixin",
+    "fmessage",
+    "medianote",
+    "floatbottle",
+    "newsapp",
+    "qqmail",
+    "tmessage",
+    "qmessage",
+    "weibo",
+}
+
 
 def normalize_wechat_id(raw: str | None) -> str:
     if not raw:
         return ""
-    return raw.strip().removeprefix("wechat:").strip()
+    value = raw.strip()
+    for prefix in ("wechat:group:", "wechat:"):
+        if value.startswith(prefix):
+            value = value[len(prefix) :].strip()
+    return value
 
 
 def normalize_allowlist(values: list[str] | None) -> list[str]:
@@ -87,11 +104,61 @@ def is_leading_self_mention(
     return any(target in normalized_aliases for target in mention_targets)
 
 
-def is_official_account(chat_id: str) -> bool:
-    return normalize_wechat_id(chat_id).startswith("gh_")
+def is_native_mentioned(
+    mentions: dict[str, Any] | None,
+    raw_text: str,
+    aliases: list[str] | set[str] | tuple[str, ...],
+) -> bool:
+    """结合 agent-wechat v1 NativeMentions 元数据与文本前缀判断是否提及了机器人。"""
+
+    if isinstance(mentions, dict):
+        state = str(mentions.get("state") or "")
+        if state == "known":
+            if mentions.get("self") is True or mentions.get("all") is True:
+                return True
+        user_ids = mentions.get("userIds")
+        if isinstance(user_ids, list) and user_ids and aliases:
+            normalized_aliases = {
+                _normalize_mention_target(item) for item in aliases if item
+            }
+            normalized_aliases.discard("")
+            for uid in user_ids:
+                if _normalize_mention_target(str(uid)) in normalized_aliases:
+                    return True
+
+    if raw_text and aliases:
+        return is_leading_self_mention(raw_text, aliases)
+    return False
 
 
-def is_group_chat(chat_id: str) -> bool:
+def is_official_account(
+    chat_id: str | None,
+    classification: dict[str, Any] | None = None,
+) -> bool:
+    """判断是否为公众号、服务号或系统内置账号（保留 filehelper 供测试与自用）。"""
+
+    normalized = normalize_wechat_id(chat_id)
+    if not normalized:
+        return False
+    if normalized == "filehelper":
+        return False
+    if normalized.startswith("gh_") or normalized in SYSTEM_PEER_IDS:
+        return True
+
+    if isinstance(classification, dict):
+        category = str(classification.get("category") or "").lower()
+        if category in {"business", "system"}:
+            return True
+        business_kind = str(classification.get("businessKind") or "").lower()
+        if business_kind in {"official_account", "service_account"}:
+            return True
+
+    return False
+
+
+def is_group_chat(chat_id: str | None, thread_kind: str | None = None) -> bool:
+    if thread_kind and str(thread_kind).lower() == "group":
+        return True
     return normalize_wechat_id(chat_id).endswith("@chatroom")
 
 

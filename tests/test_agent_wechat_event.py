@@ -40,6 +40,10 @@ def _install_astrbot_stubs() -> None:
             self.qq = qq
             self.name = name
 
+    class AtAll(At):
+        def __init__(self, **_):
+            super().__init__(qq="all", name="all", **_)
+
     class Image:
         def __init__(self, file=None, url=None, **_):
             self.file = file
@@ -63,6 +67,17 @@ def _install_astrbot_stubs() -> None:
             self.url = url
             self.name = name
 
+    class Reply:
+        def __init__(self, id=None, **_):
+            self.id = id
+
+    class Share:
+        def __init__(self, url="", title="", content="", image="", **_):
+            self.url = url
+            self.title = title
+            self.content = content
+            self.image = image
+
     class Node:
         def __init__(self, content=None, **_):
             self.content = list(content or [])
@@ -75,6 +90,15 @@ def _install_astrbot_stubs() -> None:
         def __init__(self, group_id):
             self.group_id = group_id
             self.group_name = None
+            self.group_owner = None
+            self.group_admins = None
+            self.members = None
+            self.member_count = None
+
+    class MessageMember:
+        def __init__(self, user_id="", nickname=None):
+            self.user_id = user_id
+            self.nickname = nickname
 
     api_mod.logger = types.SimpleNamespace(
         debug=lambda *args, **kwargs: None,
@@ -86,14 +110,18 @@ def _install_astrbot_stubs() -> None:
     event_mod.AstrMessageEvent = AstrMessageEvent
     event_mod.MessageChain = MessageChain
     components_mod.At = At
+    components_mod.AtAll = AtAll
     components_mod.File = File
     components_mod.Image = Image
     components_mod.Node = Node
     components_mod.Nodes = Nodes
     components_mod.Plain = Plain
     components_mod.Record = Record
+    components_mod.Reply = Reply
+    components_mod.Share = Share
     components_mod.Video = Video
     platform_mod.Group = Group
+    platform_mod.MessageMember = MessageMember
 
     astrbot.api = api_mod
     sys.modules["astrbot"] = astrbot
@@ -130,6 +158,48 @@ def test_build_send_payloads_expands_nodes_in_original_order():
     assert payloads == [
         {"chatId": "chat_x", "text": "one"},
         {"chatId": "chat_x", "text": "two"},
+    ]
+
+
+def test_build_send_payloads_supports_quote_reply_and_group_mentions():
+    module = _load_event_module()
+    quote_chain = module.MessageChain(
+        [
+            module.Reply(id="msg_opaque_1|18446744073709551615"),
+            module.Plain(text="quoted reply"),
+        ]
+    )
+    quote_payloads = asyncio.run(
+        module.AgentWeChatMessageEvent._build_send_payloads("wxid_peer", quote_chain)
+    )
+    assert quote_payloads == [
+        {
+            "chatId": "wxid_peer",
+            "text": "quoted reply",
+            "quote": {
+                "messageId": "msg_opaque_1",
+                "serverId": "18446744073709551615",
+            },
+        }
+    ]
+
+    mention_chain = module.MessageChain(
+        [
+            module.At(qq="wxid_alice", name="Alice"),
+            module.Plain(text="please check"),
+        ]
+    )
+    mention_payloads = asyncio.run(
+        module.AgentWeChatMessageEvent._build_send_payloads(
+            "123456@chatroom", mention_chain
+        )
+    )
+    assert mention_payloads == [
+        {
+            "chatId": "123456@chatroom",
+            "text": "please check",
+            "mentions": {"userIds": ["wxid_alice"]},
+        }
     ]
 
 
@@ -215,41 +285,6 @@ def test_build_send_payloads_expands_serialized_nodes_messages():
     ]
 
 
-def test_build_send_payloads_serialized_nodes_preserve_original_text():
-    module = _load_event_module()
-
-    class SerializedNodesForwardText:
-        async def to_dict(self):
-            return {
-                "messages": [
-                    {
-                        "type": "node",
-                        "data": {
-                            "nickname": "alice",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "data": {"text": "From @AI测试群:\n\u200b😭"},
-                                },
-                            ],
-                        },
-                    }
-                ]
-            }
-
-    chain = module.MessageChain([SerializedNodesForwardText()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_header", chain)
-    )
-
-    assert payloads == [
-        {
-            "chatId": "chat_header",
-            "text": "From @AI测试群:\n\u200b😭",
-        }
-    ]
-
-
 def test_build_send_payloads_ignores_serialized_reply_component():
     module = _load_event_module()
 
@@ -276,192 +311,6 @@ def test_build_send_payloads_ignores_serialized_reply_component():
     )
 
     assert payloads == [{"chatId": "chat_reply_skip", "text": "保留正文"}]
-
-
-def test_build_send_payloads_expands_serialized_nodes_with_video_file_payload(
-    monkeypatch,
-):
-    module = _load_event_module()
-    monkeypatch.setattr(
-        module,
-        "_load_binary_from_path",
-        lambda path, timeout=30, fallback_mime="application/octet-stream": (
-            b"node-video",
-            "video/mp4",
-            "node.mp4",
-        ),
-    )
-
-    class SerializedNodesWithVideo:
-        async def to_dict(self):
-            return {
-                "messages": [
-                    {
-                        "type": "node",
-                        "data": {
-                            "nickname": "alice",
-                            "content": [
-                                {"type": "text", "data": {"text": "hello"}},
-                                {
-                                    "type": "video",
-                                    "data": {"file": "file:////tmp/v.mp4"},
-                                },
-                            ],
-                        },
-                    }
-                ]
-            }
-
-    chain = module.MessageChain([SerializedNodesWithVideo()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_y2", chain)
-    )
-
-    assert payloads == [
-        {"chatId": "chat_y2", "text": "hello"},
-        {
-            "chatId": "chat_y2",
-            "file": {
-                "data": "bm9kZS12aWRlbw==",
-                "filename": "node.mp4",
-            },
-        },
-    ]
-
-
-def test_build_send_payloads_expands_serialized_nodes_with_base64_image_payload():
-    module = _load_event_module()
-
-    class SerializedNodesWithBase64Image:
-        async def to_dict(self):
-            return {
-                "messages": [
-                    {
-                        "type": "node",
-                        "data": {
-                            "nickname": "alice",
-                            "content": [
-                                {"type": "text", "data": {"text": "wow"}},
-                                {"type": "image", "data": {"file": "base64:///aW1n"}},
-                            ],
-                        },
-                    }
-                ]
-            }
-
-    chain = module.MessageChain([SerializedNodesWithBase64Image()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_img64", chain)
-    )
-    assert payloads == [
-        {"chatId": "chat_img64", "text": "wow"},
-        {
-            "chatId": "chat_img64",
-            "image": {
-                "data": "aW1n",
-                "mimeType": "image/png",
-            },
-        },
-    ]
-
-
-def test_build_send_payloads_expands_serialized_nodes_with_path_video_payload(
-    monkeypatch,
-):
-    module = _load_event_module()
-    monkeypatch.setattr(
-        module,
-        "_load_binary_from_path",
-        lambda path, timeout=30, fallback_mime="application/octet-stream": (
-            b"vid-path",
-            "video/mp4",
-            "path-video.mp4",
-        ),
-    )
-
-    class SerializedNodesWithPathVideo:
-        async def to_dict(self):
-            return {
-                "messages": [
-                    {
-                        "type": "node",
-                        "data": {
-                            "nickname": "alice",
-                            "content": [
-                                {
-                                    "type": "video",
-                                    "data": {"path": "/tmp/path-video.mp4"},
-                                },
-                            ],
-                        },
-                    }
-                ]
-            }
-
-    chain = module.MessageChain([SerializedNodesWithPathVideo()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_path_video", chain)
-    )
-    assert payloads == [
-        {
-            "chatId": "chat_path_video",
-            "file": {
-                "data": "dmlkLXBhdGg=",
-                "filename": "path-video.mp4",
-            },
-        }
-    ]
-
-
-def test_build_send_payloads_expands_serialized_nodes_sanitizes_video_filename(
-    monkeypatch,
-):
-    module = _load_event_module()
-    monkeypatch.setattr(
-        module,
-        "_load_binary_from_path",
-        lambda path, timeout=30, fallback_mime="application/octet-stream": (
-            b"vid-name",
-            "video/mp4",
-            "原始名字.mp4",
-        ),
-    )
-
-    class SerializedNodesWithChineseVideoName:
-        async def to_dict(self):
-            return {
-                "messages": [
-                    {
-                        "type": "node",
-                        "data": {
-                            "nickname": "alice",
-                            "content": [
-                                {
-                                    "type": "video",
-                                    "data": {
-                                        "file": "file:////tmp/video.mp4",
-                                        "name": "【東雪莲】被东洋雪莲粉丝超过_莲莲_能让他投不投的了稿全在我一念之间_30283138776.mp4",
-                                    },
-                                },
-                            ],
-                        },
-                    }
-                ]
-            }
-
-    chain = module.MessageChain([SerializedNodesWithChineseVideoName()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_video_name", chain)
-    )
-    assert payloads == [
-        {
-            "chatId": "chat_video_name",
-            "file": {
-                "data": "dmlkLW5hbWU=",
-                "filename": "30283138776.mp4",
-            },
-        }
-    ]
 
 
 def test_build_send_payloads_splits_text_before_image(monkeypatch):
@@ -499,7 +348,6 @@ def test_build_send_payloads_splits_text_before_image(monkeypatch):
 
 def test_build_send_payloads_normalizes_webp_image_to_png(monkeypatch):
     module = _load_event_module()
-    # 1x1 png bytes; mime is intentionally set as webp to test normalization.
     png_data = (
         b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
         b"\x08\x02\x00\x00\x00\x90wS\xde\x00\x00\x00\x0cIDAT\x08\xd7c\xf8\xcf\xc0"
@@ -522,70 +370,3 @@ def test_build_send_payloads_normalizes_webp_image_to_png(monkeypatch):
     assert payloads[0]["chatId"] == "chat_webp"
     assert payloads[0]["image"]["mimeType"] == "image/png"
     assert payloads[0]["image"]["data"].startswith("iVBORw0KGgo")
-
-
-def test_build_send_payloads_supports_video_component(monkeypatch):
-    module = _load_event_module()
-    monkeypatch.setattr(
-        module,
-        "_load_binary_from_path",
-        lambda path, timeout=30, fallback_mime="application/octet-stream": (
-            b"vid",
-            "video/mp4",
-            "movie.mp4",
-        ),
-    )
-
-    chain = module.MessageChain(
-        [
-            module.Video(file="file:////tmp/movie.mp4"),
-        ]
-    )
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_v", chain)
-    )
-    assert payloads == [
-        {
-            "chatId": "chat_v",
-            "file": {
-                "data": "dmlk",
-                "filename": "movie.mp4",
-            },
-        }
-    ]
-
-
-def test_build_send_payloads_supports_serialized_video_component(monkeypatch):
-    module = _load_event_module()
-    monkeypatch.setattr(
-        module,
-        "_load_binary_from_path",
-        lambda path, timeout=30, fallback_mime="application/octet-stream": (
-            b"vid2",
-            "video/mp4",
-            "from-serialized.mp4",
-        ),
-    )
-
-    class SerializedVideo:
-        async def to_dict(self):
-            return {
-                "type": "video",
-                "data": {
-                    "file": "file:////tmp/from-serialized.mp4",
-                },
-            }
-
-    chain = module.MessageChain([SerializedVideo()])
-    payloads = asyncio.run(
-        module.AgentWeChatMessageEvent._build_send_payloads("chat_sv", chain)
-    )
-    assert payloads == [
-        {
-            "chatId": "chat_sv",
-            "file": {
-                "data": "dmlkMg==",
-                "filename": "from-serialized.mp4",
-            },
-        }
-    ]

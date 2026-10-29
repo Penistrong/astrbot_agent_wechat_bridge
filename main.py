@@ -1,15 +1,16 @@
 """插件根入口。
 
 框架要求插件根目录存在 `main.py`。该文件用于将根入口桥接到
-`src/` 下的实际适配器实现。
+`src/` 下的实际适配器实现，并提供远程扫码登录指令 `/wxauth` 与状态查询指令 `/wxstatus`。
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import html
+import os
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
@@ -21,10 +22,12 @@ if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
 try:
+    from .src.agent_wechat_client import WeChatClient
     from .src.agent_wechat_platform_adapter import (
         AgentWeChatPlatformAdapter as _AgentWeChatPlatformAdapter,
     )
 except ImportError:
+    from src.agent_wechat_client import WeChatClient
     from src.agent_wechat_platform_adapter import (
         AgentWeChatPlatformAdapter as _AgentWeChatPlatformAdapter,
     )
@@ -35,11 +38,11 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
 @register(
     "astrbot_agent_wechat_bridge",
     "Codex",
-    "AstrBot platform adapter for agent-wechat.",
-    "0.3.19",
+    "AstrBot platform adapter for agent-wechat (1.x Native /v1 API).",
+    "1.0.0",
 )
 class AgentWeChatBridgePlugin(Star):
-    """加载平台适配器并完成注册。"""
+    """加载平台适配器并提供远程登录与状态管理命令。"""
 
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
@@ -79,6 +82,12 @@ class AgentWeChatBridgePlugin(Star):
             return 60.0
         return max(1.0, value)
 
+    def _resolve_active_client(self) -> WeChatClient | None:
+        adapter = AgentWeChatPlatformAdapter.get_active_instance()
+        if adapter is not None:
+            return adapter.get_client()
+        return None
+
     async def _broadcast_chain(self, chain: MessageChain) -> int:
         umos = self._get_logout_notify_umos()
         if not umos:
@@ -103,7 +112,7 @@ class AgentWeChatBridgePlugin(Star):
             max_count=self._get_logout_notify_max_count(),
         )
         chain = MessageChain().message(
-            "[agent-wechat]微信好像退出登录了呢，输入/wxauth登录吧"
+            "[agent-wechat] 微信账号当前未登录或已断开连接，请发送 /wxauth 获取远程登录二维码。"
         )
         await self._broadcast_chain(chain)
 
@@ -111,79 +120,145 @@ class AgentWeChatBridgePlugin(Star):
         AgentWeChatPlatformAdapter.set_logout_notifier(None)
         AgentWeChatPlatformAdapter.reset_logout_warning_state()
 
-    @filter.command("wxauth")
-    async def wxauth(self, event: AstrMessageEvent):
-        """执行 wx auth login 并将终端二维码截图推送到配置的 UMO 列表。"""
-        yield event.plain_result("开始执行 `wx auth login`，正在抓取终端二维码截图...")
-
-        output = await self._run_wx_auth_login_capture()
-        image_url = await self._render_terminal_capture_image(output)
-
-        chain = MessageChain().message("[agent-wechat] `wx auth login` 终端二维码截图")
-        if image_url:
-            chain.url_image(image_url)
-        else:
-            chain.message("\n（截图生成失败，请查看日志）")
-
-        sent_count = await self._broadcast_chain(chain)
-        if sent_count <= 0:
+    @filter.command("wxstatus")
+    async def wxstatus(self, event: AstrMessageEvent):
+        """查询远端 agent-wechat 守护进程与微信账号连接状态。"""
+        client = self._resolve_active_client()
+        if client is None:
             yield event.plain_result(
-                "未发送：请先在插件配置的“退出登录提醒”中填写 UMO 列表（可用 /sid 获取）。"
+                "未找到运行中的 agent_wechat 平台实例，请先在 AstrBot 平台管理中启用 agent_wechat。"
             )
             return
 
-        yield event.plain_result(f"已推送 wx 登录二维码截图到 {sent_count} 个 UMO。")
-
-    async def _run_wx_auth_login_capture(self) -> str:
-        cmd = "wx auth login"
         try:
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            daemon = await asyncio.to_thread(client.status)
+            auth = await asyncio.to_thread(client.auth_status)
         except Exception as exc:
-            return f"启动命令失败: {exc}"
+            yield event.plain_result(f"查询远端 agent-wechat 状态失败: {exc}")
+            return
+
+        version_info = daemon.get("version") if isinstance(daemon, dict) else {}
+        ver_str = (
+            version_info.get("version")
+            if isinstance(version_info, dict)
+            else "unknown"
+        )
+        summary = (
+            f"[agent-wechat 状态]\n"
+            f"- 服务地址: {client.base_url}\n"
+            f"- 守护进程版本: {ver_str}\n"
+            f"- 账号 ID: {auth.get('accountId') or client.account_id}\n"
+            f"- 微信用户: {auth.get('loggedInUser') or '未获取'}\n"
+            f"- 认证状态: {'已认证' if auth.get('authenticated') else '未认证'}\n"
+            f"- 连接状态: {auth.get('connection')}"
+        )
+        yield event.plain_result(summary)
+
+    @filter.command("wxauth")
+    async def wxauth(self, event: AstrMessageEvent):
+        """通过远端 agent-wechat /v1 API 发起登录并获取 PNG 二维码。"""
+        client = self._resolve_active_client()
+        if client is None:
+            yield event.plain_result(
+                "未找到运行中的 agent_wechat 平台实例，请先在平台管理中启用 agent_wechat。"
+            )
+            return
+
+        yield event.plain_result(
+            "正在向远端 agent-wechat 服务请求微信登录操作，请稍候..."
+        )
 
         try:
-            raw, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
-            output = raw.decode("utf-8", errors="replace") if raw else ""
-        except asyncio.TimeoutError:
-            output = ""
-            if proc.stdout is not None:
-                try:
-                    chunk = await asyncio.wait_for(proc.stdout.read(16384), timeout=1.5)
-                    output = chunk.decode("utf-8", errors="replace") if chunk else ""
-                except Exception:
-                    pass
-            with contextlib.suppress(Exception):
-                proc.kill()
-                await proc.wait()
+            op, qr_png_bytes = await self._start_and_wait_for_qr(client)
+        except Exception as exc:
+            yield event.plain_result(f"请求远端 agent-wechat 登录失败: {exc}")
+            return
 
-        output = output.strip()
-        if not output:
-            output = "命令已执行，但未捕获到终端输出。"
-        return output
+        state = str(op.get("state") or "unknown")
+        if state == "succeeded":
+            yield event.plain_result(
+                "远端微信账号已通过已保存的设备信任自动恢复登录，无需扫码！"
+            )
+            return
 
-    async def _render_terminal_capture_image(self, output: str) -> str | None:
-        escaped = html.escape(output)
-        template = """
-        <div style=\"width:100vw;height:100vh;box-sizing:border-box;padding:16px 18px;background:#0b1220;color:#e5e7eb;font-family:Consolas,Monaco,monospace;\">
-          <div style=\"font-size:18px;font-weight:600;margin-bottom:10px;color:#93c5fd;\">wx auth login terminal capture</div>
-          <pre style=\"margin:0;white-space:pre-wrap;word-break:break-word;line-height:1.4;font-size:16px;\">{{ text }}</pre>
-        </div>
-        """
-        options = {
-            "full_page": False,
-            "omit_background": False,
+        if not qr_png_bytes:
+            yield event.plain_result(
+                f"登录操作已发起 (operation={op.get('id')}, state={state})，"
+                "请在手机微信上确认登录，或稍后重试 `/wxauth`。"
+            )
+            return
+
+        qr_path = self._save_qr_png(qr_png_bytes)
+        yield event.chain_result(
+            [
+                event.plain_result(
+                    "[agent-wechat] 请使用手机微信扫描下方二维码并确认登录："
+                ).chain[0],
+            ]
+        )
+        yield event.image_result(qr_path)
+
+        chain = (
+            MessageChain()
+            .message("[agent-wechat] 微信远程登录二维码，请使用手机微信扫码确认：")
+            .file_image(qr_path)
+        )
+        sent_count = await self._broadcast_chain(chain)
+        if sent_count > 0:
+            yield event.plain_result(
+                f"同时已将登录二维码推送到 {sent_count} 个提醒会话。"
+            )
+
+    async def _start_and_wait_for_qr(
+        self, client: WeChatClient
+    ) -> tuple[dict, bytes | None]:
+        op = await asyncio.to_thread(
+            client.start_login,
+            strategy="auto",
+            allow_qr=True,
+            force_qr=False,
+            timeout_seconds=300,
+        )
+        op_id = str(op.get("id") or "").strip()
+        if not op_id:
+            return op, None
+
+        terminal_states = {
+            "succeeded",
+            "failed",
+            "cancelled",
+            "expired",
+            "rejected",
+            "needs_login",
         }
-        try:
-            return await self.html_render(
-                template,
-                {"text": escaped},
-                return_url=True,
-                options=options,
-            )
-        except Exception as exc:
-            logger.warning(f"[agent_wechat] 终端截图渲染失败: {exc}")
-            return None
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            state = str(op.get("state") or "")
+            if state in terminal_states:
+                return op, None
+
+            result = op.get("result") if isinstance(op.get("result"), dict) else {}
+            if result.get("qrAvailable") is True:
+                generation = result.get("qrGeneration")
+                gen_int = int(generation) if isinstance(generation, int) else None
+                png_bytes = await asyncio.to_thread(
+                    client.get_login_qr_png, op_id, gen_int
+                )
+                return op, png_bytes
+
+            if state == "awaiting_approval":
+                return op, None
+
+            await asyncio.sleep(0.5)
+            op = await asyncio.to_thread(client.get_operation, op_id)
+
+        return op, None
+
+    @staticmethod
+    def _save_qr_png(png_bytes: bytes) -> str:
+        directory = os.path.join(tempfile.gettempdir(), "agent_wechat_bridge")
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"wx_login_qr_{int(time.time())}.png")
+        with open(path, "wb") as handle:
+            handle.write(png_bytes)
+        return path

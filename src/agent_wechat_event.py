@@ -1,4 +1,4 @@
-"""平台适配器使用的消息事件对象。"""
+"""平台适配器使用的消息事件对象（适配 agent-wechat 1.x Native /v1 API）。"""
 
 from __future__ import annotations
 
@@ -16,32 +16,39 @@ from io import BytesIO
 from typing import Any
 
 import requests
-from PIL import Image as PILImage
+
+try:
+    from PIL import Image as PILImage
+except ImportError:
+    PILImage = None
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
 from astrbot.api.message_components import (
     At,
+    AtAll,
     File,
     Image,
     Node,
     Nodes,
     Plain,
     Record,
+    Reply,
+    Share,
     Video,
 )
-from astrbot.api.platform import Group
+from astrbot.api.platform import Group, MessageMember
 
 from .agent_wechat_client import WeChatClient
 
-SEND_REQUEST_TIMEOUT_SECONDS = 30.0
+SEND_REQUEST_TIMEOUT_SECONDS = 120.0
 SEND_LOG_PREFIX = "[agent_wechat][send]"
-SEND_RECOVERY_RETRY_ATTEMPTS = 3
+SEND_RECOVERY_RETRY_ATTEMPTS = 2
 SEND_RECOVERY_RETRY_INTERVAL_SECONDS = 1.0
-SEND_RECOVERY_ERRORS = {"No action selected"}
 IGNORED_SERIALIZED_SEG_TYPES = {"reply"}
 MAX_FILENAME_LENGTH = 96
 OUTBOUND_IMAGE_DEDUP_WINDOW_SECONDS = 8.0
+WECHAT_MENTION_ID_RE = re.compile(r"^[A-Za-z0-9_@.-]{1,256}$")
 
 
 def _component_type_name(component: Any) -> str:
@@ -100,6 +107,12 @@ def _normalize_image_for_wechat(data: bytes, mime_type: str) -> tuple[bytes, str
     lower_mime = (mime_type or "").lower()
     if lower_mime in {"image/png", "image/jpeg", "image/jpg", "image/gif"}:
         return data, ("image/jpeg" if lower_mime == "image/jpg" else lower_mime)
+    if PILImage is None:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return data, "image/png"
+        if data.startswith(b"\xff\xd8\xff"):
+            return data, "image/jpeg"
+        return data, mime_type or "image/png"
     try:
         with PILImage.open(BytesIO(data)) as img:
             if img.mode not in {"RGB", "RGBA"}:
@@ -137,15 +150,27 @@ def _load_binary_from_path(
         data = base64.b64decode(encoded)
         return data, fallback_mime, "inline.bin"
 
+    if path.startswith("data:"):
+        header, _, encoded = path.partition(",")
+        mime_part = header[5:].split(";", 1)[0].strip() or fallback_mime
+        data = base64.b64decode(encoded)
+        ext = mimetypes.guess_extension(mime_part) or ".bin"
+        return data, mime_part, f"inline{ext}"
+
     if path.startswith(("http://", "https://")):
         response = requests.get(path, timeout=timeout)
         response.raise_for_status()
-        mime_type = response.headers.get("Content-Type") or _guess_mime_type(
-            path, fallback_mime
+        mime_type = (
+            (response.headers.get("Content-Type") or "")
+            .split(";", 1)[0]
+            .strip()
+            or _guess_mime_type(path, fallback_mime)
         )
         return response.content, mime_type, _basename_from_url(path)
 
-    normalized = path[8:] if path.startswith("file:///") else path
+    normalized = path[7:] if path.startswith("file://") else path
+    if normalized.startswith("//"):
+        normalized = "/" + normalized.lstrip("/")
     with open(normalized, "rb") as handle:
         data = handle.read()
     return (
@@ -153,6 +178,64 @@ def _load_binary_from_path(
         _guess_mime_type(normalized, fallback_mime),
         os.path.basename(normalized),
     )
+
+
+def _media_payload_entry(
+    chat_id: str,
+    seg_type: str,
+    data: bytes,
+    mime_type: str,
+    filename: str,
+) -> dict[str, Any]:
+    encoded = base64.b64encode(data).decode("utf-8")
+    safe_filename = _sanitize_filename(filename)
+    lower_type = seg_type.lower()
+    if lower_type in {"record", "audio", "voice"}:
+        return {
+            "chatId": chat_id,
+            "voice": {
+                "data": encoded,
+                "filename": safe_filename,
+                "mimeType": mime_type or "audio/wav",
+            },
+            "file": {
+                "data": encoded,
+                "filename": safe_filename,
+                "mimeType": mime_type or "audio/wav",
+                "kind": "voice",
+            },
+        }
+    if lower_type == "video":
+        return {
+            "chatId": chat_id,
+            "file": {
+                "data": encoded,
+                "filename": safe_filename,
+                "mimeType": mime_type or "video/mp4",
+                "kind": "video",
+            },
+        }
+    return {
+        "chatId": chat_id,
+        "file": {
+            "data": encoded,
+            "filename": safe_filename,
+            "mimeType": mime_type or "application/octet-stream",
+            "kind": "file",
+        },
+    }
+
+
+def parse_quote_reference(reply_id: Any) -> dict[str, str] | None:
+    """从 Reply.id 中解析出 agent-wechat 所需的 {messageId, serverId}。"""
+    raw = str(reply_id or "").strip()
+    if not raw:
+        return None
+    if "|" in raw:
+        msg_id, srv_id = raw.rsplit("|", 1)
+        if msg_id and srv_id.isdigit() and int(srv_id) > 0:
+            return {"messageId": msg_id, "serverId": srv_id}
+    return None
 
 
 class AgentWeChatMessageEvent(AstrMessageEvent):
@@ -201,14 +284,32 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
     ) -> list[dict[str, Any]]:
         payloads: list[dict[str, Any]] = []
         text_buffer: list[str] = []
+        mention_user_ids: list[str] = []
+        mention_all = False
+        pending_quote: dict[str, str] | None = None
+        is_group = str(chat_id).endswith("@chatroom")
 
         def flush_text_only() -> None:
-            if not text_buffer:
+            nonlocal mention_all, pending_quote
+            if not text_buffer and not mention_user_ids and not mention_all:
                 return
             text = "".join(text_buffer)
+            if not text and (mention_user_ids or mention_all):
+                text = " "
             if text != "":
-                payloads.append({"chatId": chat_id, "text": text})
+                item: dict[str, Any] = {"chatId": chat_id, "text": text}
+                if pending_quote and not mention_user_ids and not mention_all:
+                    item["quote"] = pending_quote
+                elif is_group and (mention_all or mention_user_ids):
+                    if mention_all:
+                        item["mentions"] = {"all": True}
+                    else:
+                        item["mentions"] = {"userIds": list(mention_user_ids)}
+                payloads.append(item)
             text_buffer.clear()
+            mention_user_ids.clear()
+            mention_all = False
+            pending_quote = None
 
         async def expand_serialized_nodes(serialized: dict[str, Any]) -> int:
             messages = serialized.get("messages")
@@ -349,13 +450,58 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 if expanded > 0:
                     continue
 
+            if isinstance(component, Reply):
+                quote_ref = parse_quote_reference(getattr(component, "id", None))
+                if quote_ref:
+                    pending_quote = quote_ref
+                continue
+
+            if isinstance(component, Share):
+                flush_text_only()
+                url = str(getattr(component, "url", "") or "").strip()
+                title = str(getattr(component, "title", "") or url or "分享").strip()
+                if url:
+                    share_payload: dict[str, Any] = {
+                        "chatId": chat_id,
+                        "kind": "share",
+                        "title": title,
+                        "url": url,
+                    }
+                    content_desc = str(getattr(component, "content", "") or "").strip()
+                    if content_desc:
+                        share_payload["description"] = content_desc
+                    thumb = str(getattr(component, "image", "") or "").strip()
+                    if thumb.startswith(("http://", "https://")):
+                        share_payload["thumbnailUrl"] = thumb
+                    payloads.append(share_payload)
+                continue
+
             if isinstance(component, Plain):
                 cls._push_text(text_buffer, component.text)
                 continue
 
+            if isinstance(component, AtAll):
+                if is_group:
+                    mention_all = True
+                else:
+                    cls._push_text(text_buffer, "@所有人 ")
+                continue
+
             if isinstance(component, At):
-                cls._push_text(text_buffer, cls._at_to_text(component))
-                cls._push_text(text_buffer, " ")
+                qq = str(getattr(component, "qq", "") or "").strip()
+                if is_group and qq in {"all", "notify@all"}:
+                    mention_all = True
+                elif (
+                    is_group
+                    and qq
+                    and WECHAT_MENTION_ID_RE.match(qq)
+                    and getattr(component, "name", None)
+                ):
+                    if qq not in mention_user_ids:
+                        mention_user_ids.append(qq)
+                else:
+                    cls._push_text(text_buffer, cls._at_to_text(component))
+                    cls._push_text(text_buffer, " ")
                 continue
 
             if isinstance(component, Image):
@@ -373,10 +519,7 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 image_data, normalized_mime = await asyncio.to_thread(
                     _normalize_image_for_wechat, data, mime_type or "image/png"
                 )
-                text = "".join(text_buffer)
-                if text != "":
-                    payloads.append({"chatId": chat_id, "text": text})
-                text_buffer.clear()
+                flush_text_only()
                 payloads.append(
                     {
                         "chatId": chat_id,
@@ -388,26 +531,71 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 )
                 continue
 
-            if isinstance(component, (File, Record, Video)):
-                source = getattr(component, "file", None) or getattr(
-                    component, "url", None
+            if isinstance(component, Record):
+                source = (
+                    getattr(component, "file", None)
+                    or getattr(component, "url", None)
+                    or getattr(component, "path", None)
                 )
                 if not source:
                     logger.warning(
-                        f"{SEND_LOG_PREFIX} skip file/record/video component without source "
+                        f"{SEND_LOG_PREFIX} skip record component without source chat={chat_id}"
+                    )
+                    continue
+                # 优先使用 AstrBot Record.convert_to_file_path 转为 wav，以便 agent-wechat 发送原生语音条
+                resolved_source = str(source)
+                if hasattr(component, "convert_to_file_path"):
+                    try:
+                        converted_path = await component.convert_to_file_path()
+                        if converted_path and os.path.exists(converted_path):
+                            resolved_source = converted_path
+                    except Exception:
+                        pass
+                data, mime_type, filename = await asyncio.to_thread(
+                    _load_binary_from_path, resolved_source, 30, "audio/wav"
+                )
+                safe_filename = _sanitize_filename(
+                    str(getattr(component, "name", None) or filename or "voice.wav")
+                )
+                flush_text_only()
+                payloads.append(
+                    {
+                        "chatId": chat_id,
+                        "file": {
+                            "data": base64.b64encode(data).decode("utf-8"),
+                            "filename": safe_filename,
+                        },
+                        "voice": {
+                            "data": base64.b64encode(data).decode("utf-8"),
+                            "filename": safe_filename,
+                            "mimeType": mime_type or "audio/wav",
+                        },
+                    }
+                )
+                continue
+
+            if isinstance(component, (File, Video)):
+                source = getattr(component, "file", None) or getattr(
+                    component, "url", None
+                )
+                if not source and hasattr(component, "get_file"):
+                    try:
+                        source = await component.get_file()
+                    except Exception:
+                        source = None
+                if not source:
+                    logger.warning(
+                        f"{SEND_LOG_PREFIX} skip file/video component without source "
                         f"chat={chat_id}"
                     )
                     continue
                 data, _, filename = await asyncio.to_thread(
-                    _load_binary_from_path, source
+                    _load_binary_from_path, str(source)
                 )
                 safe_filename = _sanitize_filename(
                     str(getattr(component, "name", None) or filename or "file.bin")
                 )
-                text = "".join(text_buffer)
-                if text != "":
-                    payloads.append({"chatId": chat_id, "text": text})
-                text_buffer.clear()
+                flush_text_only()
                 payloads.append(
                     {
                         "chatId": chat_id,
@@ -436,10 +624,7 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                 }:
                     source = _extract_segment_source(seg_data)
                     if source:
-                        text = "".join(text_buffer)
-                        if text != "":
-                            payloads.append({"chatId": chat_id, "text": text})
-                        text_buffer.clear()
+                        flush_text_only()
                         data, _, filename = await asyncio.to_thread(
                             _load_binary_from_path, str(source)
                         )
@@ -541,62 +726,37 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
             return
 
         for idx, payload in enumerate(filtered_payloads):
-            recovered = False
-            for attempt in range(1, SEND_RECOVERY_RETRY_ATTEMPTS + 1):
-                try:
-                    result = await asyncio.to_thread(
-                        client.send_message,
-                        payload,
-                        timeout=SEND_REQUEST_TIMEOUT_SECONDS,
-                    )
-                except requests.exceptions.ReadTimeout as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload timeout "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(
-                        "agent-wechat 发送超时（30秒未响应），"
-                        "请检查微信客户端是否卡在聊天切换/自动化操作中。"
-                    ) from exc
-                except requests.exceptions.RequestException as exc:
-                    logger.exception(
-                        f"{SEND_LOG_PREFIX} send payload request error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
-                    )
-                    raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
-
-                if result.get("success", True):
-                    recovered = True
-                    break
-
-                error = str(result.get("error") or "")
-                recoverable = error in SEND_RECOVERY_ERRORS
-                if recoverable and attempt < SEND_RECOVERY_RETRY_ATTEMPTS:
-                    logger.warning(
-                        f"{SEND_LOG_PREFIX} recoverable send error "
-                        f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                        f"attempt={attempt}/{SEND_RECOVERY_RETRY_ATTEMPTS} "
-                        f"error={error}; trying open_chat and retry"
-                    )
-                    try:
-                        await asyncio.to_thread(client.open_chat, chat_id, False)
-                    except Exception as exc:
-                        logger.warning(
-                            f"{SEND_LOG_PREFIX} open_chat before retry failed "
-                            f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} error={exc}"
-                        )
-                    await asyncio.sleep(SEND_RECOVERY_RETRY_INTERVAL_SECONDS)
-                    continue
-
-                logger.error(
-                    f"{SEND_LOG_PREFIX} send payload failed "
-                    f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
-                    f"error={error}"
+            try:
+                result = await asyncio.to_thread(
+                    client.send_message,
+                    payload,
+                    timeout=SEND_REQUEST_TIMEOUT_SECONDS,
                 )
-                raise RuntimeError(error or "agent-wechat 发送失败")
+            except requests.exceptions.ReadTimeout as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload timeout "
+                    f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
+                )
+                raise RuntimeError(
+                    "agent-wechat 发送超时，请检查远端 agent-wechat 守护进程连接状态。"
+                ) from exc
+            except requests.exceptions.RequestException as exc:
+                logger.exception(
+                    f"{SEND_LOG_PREFIX} send payload request error "
+                    f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)}"
+                )
+                raise RuntimeError(f"agent-wechat 发送请求失败: {exc}") from exc
 
-            if not recovered:
-                raise RuntimeError("agent-wechat 发送失败：重试后仍失败")
+            if result.get("success", True):
+                continue
+
+            error = str(result.get("error") or "")
+            logger.error(
+                f"{SEND_LOG_PREFIX} send payload failed "
+                f"chat={chat_id} idx={idx + 1}/{len(filtered_payloads)} "
+                f"error={error}"
+            )
+            raise RuntimeError(error or "agent-wechat 发送失败")
 
     async def send(self, message: MessageChain) -> None:
         await self.send_message_chain(self.client, self.chat_id, message)
@@ -608,7 +768,6 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
         use_fallback: bool = False,
     ) -> None:
         if use_fallback:
-            # 兼容不支持原生流式的场景，按分片逐段发送。
             async for chain in generator:
                 await self.send(chain)
                 await asyncio.sleep(1.2)
@@ -621,19 +780,58 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                     parts.append(component.text)
 
         if parts:
-            # 非回退模式下，将流式纯文本聚合为一次发送。
             await self.send(MessageChain([Plain(text="".join(parts))]))
 
     async def get_group(
         self, group_id: str | None = None, **kwargs: Any
     ) -> Group | None:
-        if not self.is_group:
+        if not self.is_group and not group_id:
             return None
-        raw_group_id = (
+        raw_group_id = str(
             group_id or getattr(self.message_obj, "group_id", None) or self.chat_id
         )
-        group = Group(str(raw_group_id))
+        group = Group(raw_group_id)
         group.group_name = getattr(
             getattr(self.message_obj, "group", None), "group_name", None
         )
+        try:
+            info = await asyncio.to_thread(self.client.get_group, raw_group_id)
+            if isinstance(info, dict):
+                group.group_name = str(
+                    info.get("displayName")
+                    or info.get("name")
+                    or group.group_name
+                    or raw_group_id
+                )
+                if info.get("ownerId"):
+                    group.group_owner = str(info["ownerId"])
+                if isinstance(info.get("administratorIds"), list):
+                    group.group_admins = [str(x) for x in info["administratorIds"] if x]
+            members_page = await asyncio.to_thread(
+                self.client.list_group_members, raw_group_id, 200
+            )
+            items = (
+                members_page.get("items") if isinstance(members_page, dict) else None
+            )
+            if isinstance(items, list):
+                members: list[MessageMember] = []
+                for m in items:
+                    if not isinstance(m, dict) or m.get("deleted") is True:
+                        continue
+                    uid = str(m.get("username") or m.get("id") or "")
+                    if not uid:
+                        continue
+                    nick = str(
+                        m.get("roomDisplayName")
+                        or m.get("displayName")
+                        or m.get("mentionName")
+                        or uid
+                    )
+                    members.append(MessageMember(user_id=uid, nickname=nick))
+                group.members = members
+                group.member_count = len(members)
+        except Exception as exc:
+            logger.debug(
+                f"[agent_wechat] get_group enrichment skipped for {raw_group_id}: {exc}"
+            )
         return group

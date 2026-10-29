@@ -1,7 +1,9 @@
 from src.agent_wechat_access import (
     extract_leading_mentions,
-    is_leading_self_mention,
     is_group_chat,
+    is_leading_self_mention,
+    is_native_mentioned,
+    is_official_account,
     is_sender_allowed,
     normalize_allowlist,
     normalize_wechat_id,
@@ -12,11 +14,15 @@ from src.agent_wechat_access import (
 
 def test_normalize_wechat_id() -> None:
     assert normalize_wechat_id("wechat:wxid_abc") == "wxid_abc"
+    assert normalize_wechat_id("wechat:group:123@chatroom") == "123@chatroom"
     assert normalize_wechat_id("  wxid_abc  ") == "wxid_abc"
 
 
 def test_normalize_allowlist_deduplicates() -> None:
-    assert normalize_allowlist(["wxid_a", "wechat:wxid_a", "wxid_b"]) == ["wxid_a", "wxid_b"]
+    assert normalize_allowlist(["wxid_a", "wechat:wxid_a", "wxid_b"]) == [
+        "wxid_a",
+        "wxid_b",
+    ]
 
 
 def test_strip_leading_mentions() -> None:
@@ -35,9 +41,59 @@ def test_is_leading_self_mention() -> None:
     assert is_leading_self_mention("@Chill\u2005hi", {"小暹罗"}) is False
 
 
+def test_is_native_mentioned() -> None:
+    assert (
+        is_native_mentioned(
+            {"state": "known", "self": True, "all": False, "userIds": ["wxid_bot"]},
+            "hello",
+            set(),
+        )
+        is True
+    )
+    assert (
+        is_native_mentioned(
+            {"state": "known", "self": False, "all": True, "userIds": []},
+            "hello",
+            set(),
+        )
+        is True
+    )
+    assert (
+        is_native_mentioned(
+            {"state": "unknown", "self": None, "all": None, "userIds": []},
+            "@小暹罗\u2005hello",
+            {"小暹罗"},
+        )
+        is True
+    )
+    assert (
+        is_native_mentioned(
+            {"state": "known", "self": False, "all": False, "userIds": ["wxid_other"]},
+            "hello",
+            {"小暹罗"},
+        )
+        is False
+    )
+
+
+def test_official_account_detection() -> None:
+    assert is_official_account("gh_12345") is True
+    assert is_official_account("weixin") is True
+    assert is_official_account("filehelper") is False
+    assert (
+        is_official_account(
+            "wxid_biz",
+            {"category": "business", "businessKind": "official_account"},
+        )
+        is True
+    )
+    assert is_official_account("wxid_normal", {"category": "unknown"}) is False
+
+
 def test_group_chat_detection() -> None:
     assert is_group_chat("123@chatroom") is True
     assert is_group_chat("wxid_123") is False
+    assert is_group_chat("room_id", thread_kind="group") is True
 
 
 def test_sender_allowlist() -> None:

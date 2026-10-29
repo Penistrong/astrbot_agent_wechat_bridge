@@ -1,9 +1,8 @@
-"""基于事件流与接口轮询的个人微信平台适配器。"""
+"""基于 agent-wechat 1.x (/v1) SSE 事件流与增量游标的个人微信平台适配器。"""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import re
@@ -14,7 +13,17 @@ from datetime import datetime
 from typing import Any, Awaitable, Callable, cast
 
 from astrbot.api import logger
-from astrbot.api.message_components import At, File, Image, Plain, Record
+from astrbot.api.message_components import (
+    At,
+    File,
+    Image,
+    Location,
+    Plain,
+    Record,
+    Reply,
+    Share,
+    Video,
+)
 from astrbot.api.platform import (
     AstrBotMessage,
     Group,
@@ -28,14 +37,16 @@ from astrbot.core.platform.astr_message_event import MessageSesion
 
 from .agent_wechat_access import (
     is_group_chat,
-    is_leading_self_mention,
+    is_native_mentioned,
     is_official_account,
+    normalize_allowlist,
+    should_forward_message,
     strip_leading_mentions,
 )
 from .agent_wechat_client import (
     AgentWeChatAPIError,
     WeChatClient,
-    WeChatEventWebSocketClient,
+    WeChatEventStreamClient,
 )
 from .agent_wechat_event import AgentWeChatMessageEvent
 
@@ -43,56 +54,125 @@ MSG_TYPE_TEXT = 1
 MSG_TYPE_IMAGE = 3
 MSG_TYPE_VOICE = 34
 MSG_TYPE_VIDEO = 43
+MSG_TYPE_STICKER = 47
+MSG_TYPE_LOCATION = 48
 MSG_TYPE_APP = 49
-MEDIA_TYPES = {MSG_TYPE_IMAGE, MSG_TYPE_VOICE, MSG_TYPE_VIDEO, MSG_TYPE_APP}
 
-# 仅保留 server_url / token 为可配置项，其余行为采用固定策略。
-POLL_INTERVAL_MS = 200
-FULL_SYNC_INTERVAL_MS = 1200
+SUPPORTED_MSG_TYPES = {
+    MSG_TYPE_TEXT,
+    MSG_TYPE_IMAGE,
+    MSG_TYPE_VOICE,
+    MSG_TYPE_VIDEO,
+    MSG_TYPE_STICKER,
+    MSG_TYPE_LOCATION,
+    MSG_TYPE_APP,
+}
+MEDIA_TYPES = {
+    MSG_TYPE_IMAGE,
+    MSG_TYPE_VOICE,
+    MSG_TYPE_VIDEO,
+    MSG_TYPE_STICKER,
+    MSG_TYPE_APP,
+}
+
+POLL_INTERVAL_MS = 1000
+EVENT_SYNC_INTERVAL_MS = 3000
 AUTH_POLL_INTERVAL_MS = 30000
 LOGIN_PAGE_WARN_INTERVAL_SECONDS = 60.0
-BASELINE_SYNC_PAGE_SIZE = 200
-BASELINE_SYNC_MAX_PAGES = 20
-HOT_PATH_TIMEOUT_SECONDS = 0.8
-FAST_PROBE_LIMIT = 1
-FAST_PROBE_FETCH_LIMIT = 1
-FAST_PROBE_OPEN_CHAT_ON_MISS = False
-ACTIVE_PROBE_LIMIT = 2
-ACTIVE_PROBE_FETCH_LIMIT = 2
-ACTIVE_PROBE_OPEN_CHAT = False
-ACTIVE_CHAT_KEEP = 8
-ACTIVE_CHAT_SEED = 2
-MEDIA_RETRY_ATTEMPTS = 4
-MEDIA_RETRY_INTERVAL_SECONDS = 0.25
+HOT_PATH_TIMEOUT_SECONDS = 10.0
+MEDIA_WAIT_TIMEOUT_SECONDS = 25.0
 SELF_ID_ALIAS_RE = re.compile(r"^(wxid_[^_]+)(?:_[0-9a-fA-F]{4,})$")
 
 CONFIG_METADATA = {
     "en-US": {
         "server_url": {
             "label": "服务地址",
-            "help_text": "agent-wechat 的 REST API 地址，例如 http://localhost:6174。",
+            "help_text": (
+                "agent-wechat (1.x) 的 HTTP/HTTPS API 地址，例如 "
+                "http://192.168.1.100:6174 或 https://192.168.1.100:7443。"
+            ),
             "field_type": "str",
         },
         "token": {
-            "label": "访问令牌",
-            "help_text": "若 agent-wechat 启用了鉴权，请填写终端执行 wx up 后得到的 token。",
+            "label": "访问令牌 (Bearer Token)",
+            "help_text": (
+                "必填。在部署 agent-wechat 的 Ubuntu 服务器上读取 "
+                "~/.local/share/agent-wechat/api-token 或通过 wx tokens create 创建。"
+            ),
             "field_type": "str",
             "secret": True,
+        },
+        "account_id": {
+            "label": "微信账号 ID (accountId)",
+            "help_text": (
+                "可选。执行 wx accounts list 查看 id 或 alias；留空则自动选择第一个已登录账号。"
+            ),
+            "field_type": "str",
+        },
+        "verify_tls": {
+            "label": "校验 HTTPS 证书",
+            "help_text": "跨服务器使用自签名证书连接 agent-wechat networkListen (7443) 时可设为 false。",
+            "field_type": "bool",
+        },
+        "read_policy": {
+            "label": "已读回执策略",
+            "help_text": "on_inbound: 收到并投递给 AstrBot 后标记会话已读；never: 不修改微信未读状态。",
+            "field_type": "str",
+            "options": ["on_inbound", "never"],
+        },
+        "require_group_mention": {
+            "label": "群聊仅在 @机器人 时唤醒",
+            "help_text": "开启后群聊需 @机器人 才会触发大模型回复；关闭则群内所有消息均触发。",
+            "field_type": "bool",
+        },
+        "dm_policy": {
+            "label": "私聊访问策略",
+            "help_text": "open: 允许所有私聊；allowlist: 仅允许白名单；disabled: 禁用私聊。",
+            "field_type": "str",
+            "options": ["open", "allowlist", "disabled"],
+        },
+        "dm_allowlist": {
+            "label": "私聊白名单",
+            "help_text": "当私聊策略为 allowlist 时生效，填写允许的 wxid 列表。",
+            "field_type": "list",
+        },
+        "group_policy": {
+            "label": "群聊访问策略",
+            "help_text": "open: 允许所有群聊；allowlist: 仅允许白名单发送者/群；disabled: 禁用群聊。",
+            "field_type": "str",
+            "options": ["open", "allowlist", "disabled"],
+        },
+        "group_allowlist": {
+            "label": "群聊白名单",
+            "help_text": "当群聊策略为 allowlist 时生效，可填写群 ID (xxx@chatroom) 或发送者 wxid。",
+            "field_type": "list",
         },
     }
 }
 
 DEFAULT_CONFIG = {
-    "server_url": "http://localhost:6174",
+    "server_url": "http://127.0.0.1:6174",
     "token": "",
+    "account_id": "",
+    "verify_tls": False,
+    "read_policy": "on_inbound",
+    "require_group_mention": False,
+    "dm_policy": "open",
+    "dm_allowlist": [],
+    "group_policy": "open",
+    "group_allowlist": [],
 }
 
 
-def _parse_timestamp(value: str | None) -> int:
-    if not value:
+def _parse_timestamp(value: str | int | float | None) -> int:
+    if value is None or value == "":
         return int(time.time())
+    if isinstance(value, (int, float)):
+        return int(value / 1000) if value > 1_000_000_000_000 else int(value)
     try:
-        return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        return int(
+            datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+        )
     except ValueError:
         return int(time.time())
 
@@ -106,30 +186,51 @@ def _safe_temp_dir() -> str:
         return tempfile.gettempdir()
 
 
+def _safe_state_dir() -> str:
+    try:
+        from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
+
+        path = os.path.join(
+            get_astrbot_plugin_data_path(), "astrbot_agent_wechat_bridge"
+        )
+    except Exception:
+        path = os.path.join(_safe_temp_dir(), "astrbot_agent_wechat_bridge_state")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _mime_to_component(path: str, mime_type: str, filename: str):
-    if mime_type.startswith("image/"):
+    lower_mime = (mime_type or "").lower()
+    if lower_mime.startswith("image/"):
         return Image(file=path)
-    if mime_type.startswith("audio/"):
+    if lower_mime.startswith("audio/"):
         return Record(file=path)
+    if lower_mime.startswith("video/"):
+        return Video(file=path)
     return File(name=filename or os.path.basename(path), file=path)
 
 
 @register_platform_adapter(
     "agent_wechat",
-    "WeChat adapter powered by agent-wechat.",
+    "WeChat adapter powered by agent-wechat (1.x Native API).",
     default_config_tmpl=DEFAULT_CONFIG,
     support_streaming_message=False,
     config_metadata=CONFIG_METADATA,
     adapter_display_name="Agent WeChat",
 )
 class AgentWeChatPlatformAdapter(Platform):
-    """以事件流为主触发，接口补偿兜底。"""
+    """以 /v1 SSE 事件流为主触发，增量游标轮询补偿兜底。"""
 
+    _active_instances: list["AgentWeChatPlatformAdapter"] = []
     _logout_notifier: Callable[[str], Awaitable[None] | None] | None = None
     _logout_warn_interval_seconds: float = LOGIN_PAGE_WARN_INTERVAL_SECONDS
     _logout_warn_max_count: int = 0
     _logout_warn_sent_count: int = 0
     _logout_warn_limit_logged: bool = False
+
+    @classmethod
+    def get_active_instance(cls) -> "AgentWeChatPlatformAdapter | None":
+        return cls._active_instances[-1] if cls._active_instances else None
 
     @classmethod
     def set_logout_notifier(
@@ -164,17 +265,29 @@ class AgentWeChatPlatformAdapter(Platform):
         self.config = {**DEFAULT_CONFIG, **(platform_config or {})}
         self.metadata = PlatformMetadata(
             name="agent_wechat",
-            description="WeChat adapter powered by agent-wechat.",
+            description="WeChat adapter powered by agent-wechat (1.x Native API).",
             id=cast(str, self.config.get("id", "agent_wechat")),
             support_streaming_message=False,
         )
+        account_id_cfg = str(self.config.get("account_id") or "").strip() or None
+        verify_tls_cfg = bool(self.config.get("verify_tls", False))
         self.client = WeChatClient(
             base_url=str(self.config["server_url"]),
             token=str(self.config.get("token") or "") or None,
+            account_id=account_id_cfg,
+            verify_tls=verify_tls_cfg,
         )
         self.shutdown_event = asyncio.Event()
         self.sync_event = asyncio.Event()
-        self.last_seen_id: dict[str, int] = {}
+        self.event_cursor: str = "0"
+        self.server_id: str | None = None
+        self.consumer_id = f"astrbot-{self.metadata.id}"
+        self.seen_message_ids: set[str] = set()
+        self._seen_message_order: list[str] = []
+        self.recalled_keys: set[str] = set()
+        self.thread_cache: dict[str, dict[str, Any]] = {}
+        self.contact_cache: dict[str, dict[str, Any]] = {}
+        self.group_member_cache: dict[str, dict[str, str]] = {}
         self.last_auth_check = 0.0
         self.last_auth_status: str | None = None
         self.last_login_page_warn_at = 0.0
@@ -188,6 +301,9 @@ class AgentWeChatPlatformAdapter(Platform):
         self.last_full_sync_ms = 0.0
         self.active_chat_ids: list[str] = []
         self.chat_locks: dict[str, asyncio.Lock] = {}
+
+        if self not in self.__class__._active_instances:
+            self.__class__._active_instances.append(self)
 
     def meta(self) -> PlatformMetadata:
         return self.metadata
@@ -223,6 +339,58 @@ class AgentWeChatPlatformAdapter(Platform):
             if item:
                 self.self_aliases.add(item)
 
+    def _remember_seen_message(self, message_id: str) -> None:
+        if not message_id or message_id in self.seen_message_ids:
+            return
+        self.seen_message_ids.add(message_id)
+        self._seen_message_order.append(message_id)
+        if len(self._seen_message_order) > 4000:
+            oldest = self._seen_message_order[:1000]
+            del self._seen_message_order[:1000]
+            for item in oldest:
+                self.seen_message_ids.discard(item)
+
+    def _state_file_path(self) -> str:
+        acct = self.client.account_id or "default"
+        srv = self.server_id or "default"
+        safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", f"{srv}_{acct}")
+        return os.path.join(_safe_state_dir(), f"cursor_{safe_key}.json")
+
+    def _load_persisted_state(self) -> None:
+        path = self._state_file_path()
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            cursor = str(data.get("cursor") or "").strip()
+            if cursor.isdigit():
+                self.event_cursor = cursor
+            seen = data.get("seenMessageIds")
+            if isinstance(seen, list):
+                for mid in seen[-2000:]:
+                    if isinstance(mid, str) and mid:
+                        self._remember_seen_message(mid)
+        except Exception as exc:
+            logger.warning(f"[agent_wechat] load persisted cursor failed: {exc}")
+
+    def _save_persisted_state(self) -> None:
+        path = self._state_file_path()
+        try:
+            payload = {
+                "serverId": self.server_id,
+                "accountId": self.client.account_id,
+                "cursor": self.event_cursor,
+                "seenMessageIds": self._seen_message_order[-1000:],
+                "updatedAt": int(time.time()),
+            }
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except Exception as exc:
+            logger.debug(f"[agent_wechat] save persisted cursor failed: {exc}")
+
     def _get_chat_lock(self, chat_id: str) -> asyncio.Lock:
         lock = self.chat_locks.get(chat_id)
         if lock is None:
@@ -230,25 +398,14 @@ class AgentWeChatPlatformAdapter(Platform):
             self.chat_locks[chat_id] = lock
         return lock
 
-    async def _call_client(
-        self,
-        func,
-        *args: Any,
-        timeout: float | None = None,
-    ) -> Any:
-        task = asyncio.to_thread(func, *args)
-        if timeout is None or timeout <= 0:
-            return await task
-        return await asyncio.wait_for(task, timeout=timeout)
-
     def _touch_chat(self, chat_id: str) -> None:
         if not chat_id:
             return
         if chat_id in self.active_chat_ids:
             self.active_chat_ids.remove(chat_id)
         self.active_chat_ids.insert(0, chat_id)
-        if len(self.active_chat_ids) > ACTIVE_CHAT_KEEP:
-            del self.active_chat_ids[ACTIVE_CHAT_KEEP:]
+        if len(self.active_chat_ids) > 16:
+            del self.active_chat_ids[16:]
 
     def _warn_login_page_throttled(self) -> None:
         now = time.monotonic()
@@ -269,8 +426,8 @@ class AgentWeChatPlatformAdapter(Platform):
         self.last_login_page_warn_at = now
 
         warn_text = (
-            "微信疑似已掉回登录页（auth=logged_out），"
-            "请打开 noVNC 完成重新登录"
+            "微信账号尚未登录或已离线（authenticated=false / disconnected），"
+            "请在聊天中发送 /wxauth 获取登录二维码，或在 Ubuntu 服务器执行 wx auth login"
         )
         logger.warning(f"[agent_wechat] {warn_text}")
 
@@ -286,39 +443,10 @@ class AgentWeChatPlatformAdapter(Platform):
         except Exception as exc:
             logger.warning(f"[agent_wechat] 退出登录提醒回调失败: {exc}")
 
-    def _seed_active_chats(self, chats: list[dict[str, Any]]) -> None:
-        for chat in chats[:ACTIVE_CHAT_SEED]:
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if not chat_id or is_official_account(chat_id):
-                continue
-            self._touch_chat(chat_id)
-
-    async def _fast_probe_hot_chats(self) -> None:
-        if FAST_PROBE_LIMIT <= 0:
-            return
-
-        tasks: list[asyncio.Task[None]] = []
-        for chat_id in list(self.active_chat_ids)[:FAST_PROBE_LIMIT]:
-            if self.shutdown_event.is_set() or not chat_id:
-                break
-            tasks.append(
-                asyncio.create_task(
-                    self._process_chat(
-                        {"id": chat_id, "username": chat_id, "unreadCount": 0},
-                        skip_open=True,
-                        clear_unreads=False,
-                        fetch_limit_override=FAST_PROBE_FETCH_LIMIT,
-                        refresh_on_miss=FAST_PROBE_OPEN_CHAT_ON_MISS,
-                        request_timeout_override=HOT_PATH_TIMEOUT_SECONDS,
-                        first_seen_fallback_unread=1,
-                    )
-                )
-            )
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
     async def terminate(self) -> None:
         self.shutdown_event.set()
+        if self in self.__class__._active_instances:
+            self.__class__._active_instances.remove(self)
         if self.ws_task is not None:
             self.ws_task.cancel()
 
@@ -336,16 +464,16 @@ class AgentWeChatPlatformAdapter(Platform):
         await super().send_by_session(session, message_chain)
 
     async def run(self) -> None:
-        self.ws_task = asyncio.create_task(self._run_events_ws())
+        await self._refresh_auth_if_needed()
+        self.ws_task = asyncio.create_task(self._run_events_stream())
         self.sync_event.set()
         try:
             while not self.shutdown_event.is_set():
                 event_triggered = False
                 try:
-                    # 有事件时立即同步；无事件时按轮询超时兜底。
                     await asyncio.wait_for(
                         self.sync_event.wait(),
-                        timeout=max(0.1, POLL_INTERVAL_MS / 1000),
+                        timeout=max(0.2, POLL_INTERVAL_MS / 1000),
                     )
                     event_triggered = True
                 except asyncio.TimeoutError:
@@ -359,33 +487,35 @@ class AgentWeChatPlatformAdapter(Platform):
                     if not await self._refresh_auth_if_needed():
                         continue
 
-                    await self._fast_probe_hot_chats()
-
                     now_ms = time.time() * 1000
                     if (
                         event_triggered
-                        or (now_ms - self.last_full_sync_ms) >= FULL_SYNC_INTERVAL_MS
+                        or (now_ms - self.last_full_sync_ms) >= EVENT_SYNC_INTERVAL_MS
                     ):
-                        await self._sync_once(skip_auth_check=True)
+                        await self._sync_events_once()
                         self.last_full_sync_ms = now_ms
                 except Exception as exc:
                     logger.exception(f"[agent_wechat] sync failed: {exc}")
         finally:
             self.shutdown_event.set()
+            if self in self.__class__._active_instances:
+                self.__class__._active_instances.remove(self)
             if self.ws_task is not None:
                 self.ws_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await self.ws_task
 
-    async def _run_events_ws(self) -> None:
-        ws_client = WeChatEventWebSocketClient(
-            self.client.build_events_ws_url(),
+    async def _run_events_stream(self) -> None:
+        stream_client = WeChatEventStreamClient(
+            lambda: self.client.build_events_stream_url(after=self.event_cursor),
+            token=self.client.token,
+            verify_tls=self.client.verify_tls,
             on_open=self._on_ws_open,
             on_message=self._on_ws_message,
             on_close=self._on_ws_close,
             on_error=self._on_ws_error,
         )
-        await ws_client.run_forever(self.shutdown_event)
+        await stream_client.run_forever(self.shutdown_event)
 
     async def _on_ws_open(self) -> None:
         self.ws_connected = True
@@ -394,18 +524,19 @@ class AgentWeChatPlatformAdapter(Platform):
     async def _on_ws_close(self) -> None:
         self.ws_connected = False
         if not self.shutdown_event.is_set():
-            logger.warning("[agent_wechat] events websocket disconnected")
+            logger.debug("[agent_wechat] events SSE stream closed, will reconnect")
 
     async def _on_ws_error(self, exc: Exception) -> None:
         if not self.shutdown_event.is_set():
             err_text = str(exc)
-            if "HTTP 401" in err_text or "Unauthorized" in err_text:
+            if "HTTP 401" in err_text or "unauthorized" in err_text.lower():
                 logger.warning(
-                    "[agent_wechat] events websocket error: "
-                    "未授权，终端运行wx up获取token，并填入平台配置"
+                    "[agent_wechat] events stream 鉴权失败 (HTTP 401)："
+                    "请检查平台配置的 Bearer Token（在 Ubuntu 服务器查看 "
+                    "~/.local/share/agent-wechat/api-token 或运行 wx tokens create）"
                 )
                 return
-            logger.warning(f"[agent_wechat] events websocket error: {exc}")
+            logger.warning(f"[agent_wechat] events stream error: {exc}")
 
     async def _on_ws_message(self, raw_message: str) -> None:
         if not raw_message:
@@ -433,186 +564,206 @@ class AgentWeChatPlatformAdapter(Platform):
             self.sync_event.set()
             return
 
-        event_type = str(
-            payload.get("type") or payload.get("event") or payload.get("kind") or ""
-        )
-
-        if event_type in {"ping", "pong"}:
+        if payload.get("sseEvent") == "error" or isinstance(payload.get("error"), dict):
+            err_code = str((payload.get("error") or {}).get("code") or "")
+            if err_code == "event_cursor_expired":
+                logger.warning(
+                    "[agent_wechat] event cursor expired on SSE stream, rebaselining cursor"
+                )
+                await self._rebaseline_event_cursor()
             return
 
-        if event_type in {"auth", "login", "login_state", "login_success", "status"}:
+        event_kind = str(
+            payload.get("kind") or payload.get("type") or payload.get("event") or ""
+        )
+        cursor = str(payload.get("cursor") or "").strip()
+
+        if event_kind in {"ping", "pong"}:
+            return
+
+        if event_kind in {
+            "account.updated",
+            "operation.updated",
+            "auth",
+            "login",
+            "login_state",
+            "status",
+        }:
             self.last_auth_check = 0
+            if cursor.isdigit():
+                self._advance_cursor(cursor)
             self.sync_event.set()
             return
 
-        if event_type in {
+        if event_kind in {"message.committed", "message.recalled"}:
+            await self._handle_native_event(payload)
+            return
+
+        # 兼容直接携带 message 字典的自定义测试事件
+        if event_kind in {
             "message",
             "message_received",
             "message_created",
             "wechat_message",
         }:
-            chat = payload.get("chat")
             message = payload.get("message")
-            if isinstance(chat, dict) and isinstance(message, dict):
-                chat_id = str(chat.get("username") or chat.get("id") or "")
-                local_id = int(message.get("localId", 0) or 0)
-                if (
-                    chat_id
-                    and local_id
-                    and local_id <= self.last_seen_id.get(chat_id, 0)
-                ):
+            chat = payload.get("chat") or {}
+            if isinstance(message, dict):
+                converted = await self._convert_native_message(message, chat_hint=chat)
+                if converted is not None:
+                    await self.handle_msg(converted)
+            return
+
+        if cursor.isdigit():
+            self._advance_cursor(cursor)
+        self.sync_event.set()
+
+    def _advance_cursor(self, new_cursor: str) -> None:
+        if not new_cursor or not new_cursor.isdigit():
+            return
+        if not self.event_cursor.isdigit() or int(new_cursor) > int(self.event_cursor):
+            self.event_cursor = new_cursor
+            self._save_persisted_state()
+
+    async def _ack_current_cursor(self) -> None:
+        if not self.event_cursor.isdigit() or int(self.event_cursor) <= 0:
+            return
+        with suppress(Exception):
+            await asyncio.to_thread(
+                self.client.ack_events,
+                self.consumer_id,
+                self.event_cursor,
+            )
+
+    async def _handle_native_event(self, event: dict[str, Any]) -> None:
+        kind = str(event.get("kind") or "")
+        cursor = str(event.get("cursor") or "").strip()
+        data = event.get("data") if isinstance(event.get("data"), dict) else {}
+
+        if kind == "message.recalled":
+            thread_id = str(data.get("threadId") or "")
+            server_id = str(data.get("serverId") or "")
+            message_id = str(data.get("messageId") or "")
+            if thread_id and server_id:
+                self.recalled_keys.add(f"{thread_id}:{server_id}")
+            if message_id:
+                self.recalled_keys.add(message_id)
+            if cursor.isdigit():
+                self._advance_cursor(cursor)
+                await self._ack_current_cursor()
+            return
+
+        if kind == "message.committed":
+            message_id = str(data.get("messageId") or "").strip()
+            origin = str(data.get("origin") or "live").strip()
+            direction = str(data.get("direction") or "incoming").strip()
+
+            # 过滤非实时消息（如历史导入 profile_import、首次同步 catchup、或自身发出的 local_send）
+            if origin in {"profile_import", "catchup", "local_send"} or direction == "outgoing":
+                if message_id:
+                    self._remember_seen_message(message_id)
+                if cursor.isdigit():
+                    self._advance_cursor(cursor)
+                    await self._ack_current_cursor()
+                return
+
+            if not message_id or message_id in self.seen_message_ids:
+                if cursor.isdigit():
+                    self._advance_cursor(cursor)
+                    await self._ack_current_cursor()
+                return
+
+            try:
+                message = await asyncio.to_thread(
+                    self.client.get_message,
+                    message_id,
+                    timeout=HOT_PATH_TIMEOUT_SECONDS,
+                )
+            except AgentWeChatAPIError as exc:
+                if exc.status_code in {404, 410}:
+                    self._remember_seen_message(message_id)
+                    if cursor.isdigit():
+                        self._advance_cursor(cursor)
+                        await self._ack_current_cursor()
                     return
-                converted = await self._convert_message(chat, message)
+                raise
+
+            self._remember_seen_message(message_id)
+            if isinstance(message, dict) and message:
+                converted = await self._convert_native_message(message)
                 if converted is not None:
                     self._log_inbound_message(
-                        source="ws",
-                        chat=chat,
+                        source="v1-event",
                         message=message,
                         session_id=converted.session_id,
                     )
                     await self.handle_msg(converted)
-                    if chat_id and local_id:
-                        self.last_seen_id[chat_id] = max(
-                            self.last_seen_id.get(chat_id, 0), local_id
-                        )
-                        self._touch_chat(chat_id)
+                    thread_id = str(message.get("threadId") or "")
+                    if thread_id:
+                        self._touch_chat(thread_id)
+                        await self._maybe_mark_thread_read(thread_id)
+
+            if cursor.isdigit():
+                self._advance_cursor(cursor)
+                await self._ack_current_cursor()
+
+    async def _sync_events_once(self) -> None:
+        """通过 GET /v1/accounts/{a}/events?after=CURSOR 做增量补偿同步。"""
+        for _ in range(10):
+            if self.shutdown_event.is_set():
+                return
+            try:
+                page = await asyncio.to_thread(
+                    self.client.list_events,
+                    self.event_cursor,
+                    100,
+                    timeout=HOT_PATH_TIMEOUT_SECONDS,
+                )
+            except AgentWeChatAPIError as exc:
+                if exc.code == "event_cursor_expired" or exc.status_code == 410:
+                    logger.warning(
+                        "[agent_wechat] event cursor expired during poll, rebaselining"
+                    )
+                    await self._rebaseline_event_cursor()
+                    return
+                raise
+
+            items = page.get("items") if isinstance(page, dict) else []
+            if not isinstance(items, list) or not items:
                 return
 
-            chat_id = payload.get("chatId") or payload.get("chat_id")
-            if chat_id:
-                await self._sync_chat_by_id(str(chat_id))
+            before = self.event_cursor
+            for item in items:
+                if self.shutdown_event.is_set():
+                    return
+                if isinstance(item, dict):
+                    await self._dispatch_ws_payload(item)
+
+            next_cursor = str(page.get("nextCursor") or "").strip()
+            if next_cursor.isdigit():
+                self._advance_cursor(next_cursor)
+                await self._ack_current_cursor()
+
+            if len(items) < 100 or self.event_cursor == before:
                 return
-
-        self.sync_event.set()
-
-    async def _sync_chat_by_id(self, chat_id: str) -> None:
-        if not chat_id:
-            self.sync_event.set()
-            return
-
-        self._touch_chat(chat_id)
-
-        try:
-            await self._process_chat(
-                {"id": chat_id, "username": chat_id, "unreadCount": 0},
-                skip_open=True,
-                clear_unreads=False,
-                fetch_limit_override=FAST_PROBE_FETCH_LIMIT,
-                refresh_on_miss=False,
-                request_timeout_override=HOT_PATH_TIMEOUT_SECONDS,
-                first_seen_fallback_unread=1,
-            )
-        except Exception as exc:
-            logger.warning(f"[agent_wechat] fast sync chat {chat_id} failed: {exc}")
-            self.sync_event.set()
-
-    async def _sync_once(self, *, skip_auth_check: bool = False) -> None:
-        if not skip_auth_check and not await self._refresh_auth_if_needed():
-            return
-
-        chats = await asyncio.to_thread(self.client.list_chats, 50, 0)
-        self._seed_active_chats(chats)
-        processed_chat_ids: set[str] = set()
-        for chat in chats:
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if not chat_id or chat_id in self.last_seen_id:
-                continue
-            if is_official_account(chat_id):
-                continue
-
-            unread = int(chat.get("unreadCount", 0) or 0)
-            if unread > 0:
-                continue
-            last_msg_local_id = int(chat.get("lastMsgLocalId", 0) or 0)
-            if last_msg_local_id > 0:
-                self.last_seen_id[chat_id] = last_msg_local_id
-
-        unread_chats = [
-            chat
-            for chat in chats
-            if int(chat.get("unreadCount", 0) or 0) > 0
-            and not is_official_account(chat.get("username") or chat.get("id") or "")
-        ]
-        for chat in unread_chats:
-            if self.shutdown_event.is_set():
-                break
-            await self._process_chat(
-                chat,
-                skip_open=True,
-                clear_unreads=False,
-                refresh_on_miss=False,
-                request_timeout_override=HOT_PATH_TIMEOUT_SECONDS,
-            )
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if chat_id:
-                processed_chat_ids.add(chat_id)
-
-        unread_ids = {
-            str(chat.get("username") or chat.get("id") or "") for chat in unread_chats
-        }
-        catchup_chats: list[dict[str, Any]] = []
-        for chat in chats:
-            if self.shutdown_event.is_set():
-                break
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if not chat_id or chat_id in unread_ids or chat_id not in self.last_seen_id:
-                continue
-            last_msg_local_id = int(chat.get("lastMsgLocalId", 0) or 0)
-            if last_msg_local_id > self.last_seen_id[chat_id]:
-                catchup_chats.append(chat)
-
-        for chat in catchup_chats:
-            if self.shutdown_event.is_set():
-                break
-            await self._process_chat(
-                chat,
-                skip_open=True,
-                clear_unreads=False,
-                request_timeout_override=HOT_PATH_TIMEOUT_SECONDS,
-            )
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if chat_id:
-                processed_chat_ids.add(chat_id)
-
-        await self._probe_active_chats(chats, processed_chat_ids)
-
-    async def _probe_active_chats(
-        self,
-        chats: list[dict[str, Any]],
-        processed_chat_ids: set[str],
-    ) -> None:
-        """主动探测最近会话，绕过未读元数据更新滞后。"""
-        if ACTIVE_PROBE_LIMIT <= 0:
-            return
-
-        probed = 0
-        for chat in chats:
-            if self.shutdown_event.is_set() or probed >= ACTIVE_PROBE_LIMIT:
-                break
-            chat_id = str(chat.get("username") or chat.get("id") or "")
-            if not chat_id or chat_id in processed_chat_ids:
-                continue
-            if is_official_account(chat_id):
-                continue
-
-            await self._process_chat(
-                chat,
-                skip_open=not ACTIVE_PROBE_OPEN_CHAT,
-                clear_unreads=False,
-                fetch_limit_override=ACTIVE_PROBE_FETCH_LIMIT,
-                request_timeout_override=HOT_PATH_TIMEOUT_SECONDS,
-                first_seen_fallback_unread=1,
-            )
-            probed += 1
 
     async def _refresh_auth_if_needed(self) -> bool:
         now_ms = time.time() * 1000
-        if now_ms - self.last_auth_check < AUTH_POLL_INTERVAL_MS:
-            return self.last_auth_status == "logged_in"
+        if (
+            now_ms - self.last_auth_check < AUTH_POLL_INTERVAL_MS
+            and self.last_auth_status == "logged_in"
+        ):
+            return True
 
         self.last_auth_check = now_ms
         prev_status = self.last_auth_status
         try:
+            if self.server_id is None:
+                with suppress(Exception):
+                    daemon_status = await asyncio.to_thread(self.client.status)
+                    if isinstance(daemon_status, dict) and daemon_status.get("serverId"):
+                        self.server_id = str(daemon_status["serverId"])
+
             auth = await asyncio.to_thread(self.client.auth_status)
         except Exception as exc:
             logger.warning(f"[agent_wechat] auth check failed: {exc}")
@@ -623,222 +774,260 @@ class AgentWeChatPlatformAdapter(Platform):
         if auth.get("loggedInUser"):
             self.self_id = str(auth["loggedInUser"])
             self._add_self_alias(self.self_id)
+        if auth.get("alias"):
+            self._add_self_alias(str(auth["alias"]))
 
         if self.last_auth_status != "logged_in":
+            # 若已认证但处于 disconnected，尝试自动唤醒连接
+            if bool(auth.get("authenticated")) and auth.get("connection") == "disconnected":
+                with suppress(Exception):
+                    await asyncio.to_thread(self.client.connect)
             if self.last_auth_status == "logged_out":
                 self._warn_login_page_throttled()
             return False
 
         if prev_status != "logged_in":
             self.__class__.reset_logout_warning_state()
-            await self._rebaseline_after_relogin()
+            self._load_persisted_state()
+            if self.event_cursor == "0":
+                await self._rebaseline_event_cursor()
 
         self.last_login_page_warn_at = 0.0
         return True
 
-    async def _rebaseline_after_relogin(self) -> None:
-        """登录恢复后，将各会话基线推进到当前最新，避免回灌离线期间消息。"""
-
+    async def _rebaseline_event_cursor(self) -> None:
+        """首次启动或游标过期时，将事件游标对齐到当前最新边界，避免回灌历史消息。"""
         self.suppress_inbound_during_relogin = True
         try:
-            offset = 0
-            pages = 0
-            while pages < BASELINE_SYNC_MAX_PAGES:
-                chats = await asyncio.to_thread(
-                    self.client.list_chats,
-                    BASELINE_SYNC_PAGE_SIZE,
-                    offset,
+            threads_page = await asyncio.to_thread(
+                self.client.list_threads,
+                50,
+                None,
+                timeout=HOT_PATH_TIMEOUT_SECONDS,
+            )
+            if isinstance(threads_page, dict):
+                for item in threads_page.get("items") or []:
+                    if isinstance(item, dict) and item.get("id") and not item.get("deleted"):
+                        self.thread_cache[str(item["id"])] = item
+
+                boundary = str(threads_page.get("asOfEventCursor") or "").strip()
+                if boundary.isdigit() and int(boundary) > 0:
+                    self._advance_cursor(boundary)
+                    await self._ack_current_cursor()
+                    return
+
+            # 若 threads 未返回 asOfEventCursor，则顺推事件日志至末尾
+            cursor = self.event_cursor if self.event_cursor.isdigit() else "0"
+            for _ in range(50):
+                page = await asyncio.to_thread(
+                    self.client.list_events,
+                    cursor,
+                    200,
+                    timeout=HOT_PATH_TIMEOUT_SECONDS,
                 )
-                if not chats:
+                items = page.get("items") if isinstance(page, dict) else []
+                next_cursor = str((page or {}).get("nextCursor") or cursor).strip()
+                if next_cursor.isdigit():
+                    cursor = next_cursor
+                if not isinstance(items, list) or len(items) < 200:
                     break
 
-                for chat in chats:
-                    chat_id = str(chat.get("username") or chat.get("id") or "")
-                    if not chat_id or is_official_account(chat_id):
-                        continue
-
-                    baseline = int(chat.get("lastMsgLocalId", 0) or 0)
-                    if baseline <= 0 and int(chat.get("unreadCount", 0) or 0) > 0:
-                        # 少量兼容：极端情况下 lastMsgLocalId 未更新，尝试拉 1 条取最新 localId。
-                        try:
-                            latest = await self._call_client(
-                                self.client.list_messages,
-                                chat_id,
-                                1,
-                                0,
-                                timeout=HOT_PATH_TIMEOUT_SECONDS,
-                            )
-                            if isinstance(latest, list) and latest:
-                                baseline = int(latest[0].get("localId", 0) or 0)
-                        except Exception:
-                            pass
-
-                    if baseline > 0:
-                        self.last_seen_id[chat_id] = max(
-                            self.last_seen_id.get(chat_id, 0),
-                            baseline,
-                        )
-
-                if len(chats) < BASELINE_SYNC_PAGE_SIZE:
-                    break
-                offset += BASELINE_SYNC_PAGE_SIZE
-                pages += 1
+            if cursor.isdigit():
+                self._advance_cursor(cursor)
+                await self._ack_current_cursor()
         except Exception as exc:
-            logger.warning(f"[agent_wechat] relogin baseline sync failed: {exc}")
+            logger.warning(f"[agent_wechat] baseline event cursor sync failed: {exc}")
         finally:
             self.suppress_inbound_during_relogin = False
 
-    async def _process_chat(
-        self,
-        chat: dict[str, Any],
-        skip_open: bool = False,
-        *,
-        clear_unreads: bool = True,
-        fetch_limit_override: int | None = None,
-        refresh_on_miss: bool = False,
-        request_timeout_override: float | None = None,
-        first_seen_fallback_unread: int = 0,
-    ) -> None:
-        chat_id = str(chat.get("username") or chat.get("id") or "")
-        if not chat_id:
+    async def _maybe_mark_thread_read(self, thread_id: str) -> None:
+        read_policy = str(self.config.get("read_policy") or "on_inbound").lower()
+        if read_policy == "never" or not thread_id:
             return
-
-        lock = self._get_chat_lock(chat_id)
-        async with lock:
-            if fetch_limit_override is None:
-                fetch_limit = max(int(chat.get("unreadCount", 0) or 0), 8)
-            else:
-                fetch_limit = max(1, int(fetch_limit_override))
-
-            request_timeout = request_timeout_override
-
-            async def list_messages() -> list[dict[str, Any]]:
-                try:
-                    result = await self._call_client(
-                        self.client.list_messages,
-                        chat_id,
-                        fetch_limit,
-                        0,
-                        timeout=request_timeout,
-                    )
-                except asyncio.TimeoutError:
-                    return []
-                return result if isinstance(result, list) else []
-
-            async def open_chat(clear_flag: bool) -> bool:
-                try:
-                    await self._call_client(
-                        self.client.open_chat,
-                        chat_id,
-                        clear_flag,
-                        timeout=request_timeout,
-                    )
-                    return True
-                except asyncio.TimeoutError:
-                    return False
-                except Exception as exc:
-                    logger.warning(
-                        f"[agent_wechat] failed to open chat {chat_id}: {exc}"
-                    )
-                    return False
-
-            selection_chat = chat
-            if chat_id not in self.last_seen_id:
-                unread = int(chat.get("unreadCount", 0) or 0)
-                if unread <= 0 and first_seen_fallback_unread > 0:
-                    selection_chat = {**chat, "unreadCount": first_seen_fallback_unread}
-
-            messages = await list_messages()
-            if not messages and not skip_open:
-                if await open_chat(clear_unreads):
-                    messages = await list_messages()
-            if not messages and refresh_on_miss:
-                if await open_chat(False):
-                    messages = await list_messages()
-            if not messages:
-                return
-
-            new_messages = self._select_new_messages(chat_id, selection_chat, messages)
-            if not new_messages and refresh_on_miss:
-                if await open_chat(False):
-                    messages = await list_messages()
-                    if not messages:
-                        return
-                    new_messages = self._select_new_messages(
-                        chat_id, selection_chat, messages
-                    )
-            if not new_messages:
-                return
-
-            for message in new_messages:
-                if bool(message.get("isSelf")):
-                    self._add_self_alias(message.get("sender"))
-                    self._add_self_alias(message.get("senderName"))
-                    continue
-                converted = await self._convert_message(chat, message)
-                if converted is None:
-                    continue
-                self._log_inbound_message(
-                    source="rest",
-                    chat=chat,
-                    message=message,
-                    session_id=converted.session_id,
-                )
-                await self.handle_msg(converted)
-
-            self.last_seen_id[chat_id] = max(
-                int(item.get("localId", 0) or 0) for item in new_messages
+        try:
+            thread = await asyncio.to_thread(
+                self.client.get_thread,
+                thread_id,
+                timeout=HOT_PATH_TIMEOUT_SECONDS,
             )
-            self._touch_chat(chat_id)
+            if not isinstance(thread, dict):
+                return
+            self.thread_cache[thread_id] = thread
+            expected_version = str(thread.get("readStateVersion") or "").strip()
+            unread = int(thread.get("unreadCount") or 0)
+            if expected_version and unread > 0:
+                await asyncio.to_thread(
+                    self.client.mark_thread_read,
+                    thread_id,
+                    expected_version,
+                    timeout=HOT_PATH_TIMEOUT_SECONDS,
+                )
+        except Exception as exc:
+            logger.debug(
+                f"[agent_wechat] mark_thread_read skipped for {thread_id}: {exc}"
+            )
 
-            if clear_unreads and skip_open and int(chat.get("unreadCount", 0) or 0) > 0:
-                await open_chat(True)
+    async def _resolve_thread_info(self, thread_id: str) -> dict[str, Any]:
+        cached = self.thread_cache.get(thread_id)
+        if isinstance(cached, dict):
+            return cached
+        try:
+            thread = await asyncio.to_thread(
+                self.client.get_thread,
+                thread_id,
+                timeout=HOT_PATH_TIMEOUT_SECONDS,
+            )
+            if isinstance(thread, dict):
+                self.thread_cache[thread_id] = thread
+                return thread
+        except Exception:
+            pass
+        return {"id": thread_id, "peerId": thread_id}
 
-    def _select_new_messages(
+    async def _resolve_sender_display_name(
         self,
-        chat_id: str,
-        chat: dict[str, Any],
-        messages: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        ordered = sorted(messages, key=lambda item: int(item.get("localId", 0) or 0))
-        if chat_id not in self.last_seen_id:
-            # 首次看到该会话：仅消费未读尾部，避免把历史消息整段回灌到机器人框架。
-            unread = int(chat.get("unreadCount", 0) or 0)
-            if unread <= 0:
-                self.last_seen_id[chat_id] = int(ordered[-1].get("localId", 0) or 0)
-                return []
-            if unread < len(ordered):
-                seen_max = int(ordered[-unread - 1].get("localId", 0) or 0)
-                self.last_seen_id[chat_id] = seen_max
-                return ordered[-unread:]
-            return ordered
+        thread_id: str,
+        sender_id: str,
+        is_group: bool,
+    ) -> str:
+        if not sender_id:
+            return "WeChat"
 
-        prev_last_seen = self.last_seen_id[chat_id]
-        return [
-            item
-            for item in ordered
-            if int(item.get("localId", 0) or 0) > prev_last_seen
-        ]
-
-    async def _convert_message(
-        self,
-        chat: dict[str, Any],
-        message: dict[str, Any],
-    ) -> AstrBotMessage | None:
-        chat_id = str(chat.get("username") or chat.get("id") or "")
-        sender_id = str(message.get("sender") or chat_id)
-        sender_name = str(
-            message.get("senderName") or sender_id or chat.get("name") or "WeChat"
-        )
-        is_group = is_group_chat(chat_id) or bool(chat.get("isGroup"))
-        raw_text = str(message.get("content") or "")
-        is_mentioned = bool(message.get("isMentioned"))
-        if is_group and not is_mentioned and raw_text:
-            # 某些上游场景下 isMentioned 可能缺失；用消息开头 @ 与机器人别名做兜底匹配。
-            is_mentioned = is_leading_self_mention(raw_text, self.self_aliases)
         if is_group:
-            # 当前桥接策略：群聊默认自动唤醒，不再要求显式 @ 机器人。
-            is_mentioned = True
+            room_members = self.group_member_cache.get(thread_id)
+            if room_members is None:
+                room_members = {}
+                with suppress(Exception):
+                    page = await asyncio.to_thread(
+                        self.client.list_group_members, thread_id, 200
+                    )
+                    for item in (page or {}).get("items") or []:
+                        if isinstance(item, dict) and not item.get("deleted"):
+                            uid = str(item.get("username") or item.get("id") or "")
+                            label = str(
+                                item.get("roomDisplayName")
+                                or item.get("displayName")
+                                or item.get("mentionName")
+                                or ""
+                            ).strip()
+                            if uid and label:
+                                room_members[uid] = label
+                self.group_member_cache[thread_id] = room_members
+            if sender_id in room_members:
+                return room_members[sender_id]
+
+        contact = self.contact_cache.get(sender_id)
+        if contact is None:
+            with suppress(Exception):
+                fetched = await asyncio.to_thread(self.client.get_contact, sender_id)
+                if isinstance(fetched, dict):
+                    contact = fetched
+                    self.contact_cache[sender_id] = fetched
+        if isinstance(contact, dict):
+            name = (
+                contact.get("displayName")
+                or contact.get("remark")
+                or contact.get("nickname")
+            )
+            if name:
+                return str(name)
+
+        return sender_id
+
+    async def _convert_native_message(
+        self,
+        message: dict[str, Any],
+        *,
+        chat_hint: dict[str, Any] | None = None,
+    ) -> AstrBotMessage | None:
+        """将 agent-wechat v1 NativeMessage 转换为 AstrBotMessage。"""
+        # 兼容旧版格式测试输入
+        if "localId" in message and "threadId" not in message:
+            return await self._convert_message(chat_hint or {}, message)
+
+        if message.get("deleted") is True or message.get("recall") is not None:
+            return None
+
+        direction = str(message.get("direction") or "incoming")
+        if direction == "outgoing" or bool(message.get("isSelf")):
+            self._add_self_alias(message.get("senderId"))
+            return None
+
+        thread_id = str(
+            message.get("threadId")
+            or (chat_hint or {}).get("id")
+            or (chat_hint or {}).get("username")
+            or ""
+        ).strip()
+        if not thread_id:
+            return None
+
+        server_id = str(message.get("serverId") or "").strip()
+        message_id = str(message.get("id") or "").strip()
+        if (
+            (thread_id and server_id and f"{thread_id}:{server_id}" in self.recalled_keys)
+            or (message_id and message_id in self.recalled_keys)
+        ):
+            return None
+
+        thread_info = chat_hint or await self._resolve_thread_info(thread_id)
+        classification = (
+            thread_info.get("classification")
+            if isinstance(thread_info.get("classification"), dict)
+            else None
+        )
+        if is_official_account(thread_id, classification):
+            return None
+
+        msg_type = int(message.get("type", 0) or 0) & 0x7FFFFFFF
+        app_msg_type = message.get("appMessageType")
+        if msg_type not in SUPPORTED_MSG_TYPES:
+            return None
+        # 文件上传预告 (49/74) 不触发机器人轮次
+        if msg_type == MSG_TYPE_APP and app_msg_type == 74:
+            return None
+
+        is_group = is_group_chat(thread_id, str(thread_info.get("kind") or ""))
+        sender_id = str(message.get("senderId") or message.get("sender") or "").strip()
+        if not sender_id:
+            if is_group:
+                # 群系统提示无发送者，不作为用户消息触发
+                return None
+            sender_id = thread_id
+
+        raw_text = str(message.get("body") or message.get("content") or "")
+        mentions_obj = (
+            message.get("mentions")
+            if isinstance(message.get("mentions"), dict)
+            else None
+        )
+        was_mentioned = is_native_mentioned(mentions_obj, raw_text, self.self_aliases)
+
+        require_mention = bool(self.config.get("require_group_mention", False))
+        dm_policy = str(self.config.get("dm_policy") or "open")
+        dm_allowlist = normalize_allowlist(self.config.get("dm_allowlist"))
+        group_policy = str(self.config.get("group_policy") or "open")
+        group_allowlist = normalize_allowlist(self.config.get("group_allowlist"))
+
+        # 群聊 allowlist 既支持填群 ID (xxx@chatroom)，也支持填群成员 wxid
+        effective_group_sender = (
+            thread_id
+            if is_group and thread_id in group_allowlist
+            else sender_id
+        )
+        allowed, _ = should_forward_message(
+            is_group=is_group,
+            sender_id=effective_group_sender,
+            was_mentioned=was_mentioned,
+            require_mention=require_mention,
+            dm_policy=dm_policy,
+            dm_allowlist=dm_allowlist,
+            group_policy=group_policy,
+            group_allowlist=group_allowlist,
+        )
+        if not allowed:
+            return None
+
         normalized_text = (
             strip_leading_mentions(raw_text) if is_group else raw_text.strip()
         )
@@ -846,19 +1035,69 @@ class AgentWeChatPlatformAdapter(Platform):
         components: list[Any] = []
         message_str_parts: list[str] = []
 
-        if is_group and is_mentioned:
-            # AstrBot 的群聊唤醒依赖消息链中的 At 组件；agent-wechat 的 isMentioned
-            # 仅是布尔标记，需要在这里显式补成 At(self_id)。
+        # 引用回复 (49/57 或携带 quote 对象)
+        quote = message.get("quote")
+        if isinstance(quote, dict) and quote.get("state") != "recalled":
+            q_sender = str(quote.get("senderId") or "unknown")
+            q_text = str(quote.get("embeddedText") or "").strip()
+            q_srv_id = str(quote.get("serverId") or "")
+            if q_text:
+                components.append(
+                    Reply(
+                        id=q_srv_id or message_id,
+                        chain=[Plain(text=q_text)],
+                        sender_id=q_sender,
+                        sender_nickname=q_sender,
+                        message_str=q_text,
+                        text=q_text,
+                    )
+                )
+                message_str_parts.append(f"[引用 {q_sender}: {q_text[:120]}]")
+
+        if is_group and (was_mentioned or not require_mention):
             components.append(At(qq=self.self_id, name="bot"))
 
-        if normalized_text:
+        # 位置消息 (48)
+        location = message.get("location")
+        if msg_type == MSG_TYPE_LOCATION and isinstance(location, dict):
+            lat = float(location.get("latitude") or 0.0)
+            lon = float(location.get("longitude") or 0.0)
+            loc_name = str(location.get("name") or "")
+            loc_addr = str(location.get("address") or raw_text or "")
+            components.append(
+                Location(lat=lat, lon=lon, title=loc_name, content=loc_addr)
+            )
+            loc_summary = f"[位置] {loc_name} {loc_addr} ({lat}, {lon})".strip()
+            message_str_parts.append(loc_summary)
+        elif msg_type == MSG_TYPE_APP and isinstance(message.get("link"), dict):
+            # 链接卡片 (49/3,4,5,51)
+            link = message["link"]
+            l_title = str(link.get("title") or "链接分享")
+            l_desc = str(link.get("description") or "")
+            l_url = str(link.get("url") or "")
+            if l_url:
+                components.append(Share(url=l_url, title=l_title, content=l_desc))
+            link_summary = "\n".join(
+                part for part in [f"[链接] {l_title}", l_desc, l_url] if part
+            )
+            components.append(Plain(text=link_summary))
+            message_str_parts.append(link_summary)
+        elif normalized_text:
             components.append(Plain(text=normalized_text))
             message_str_parts.append(normalized_text)
 
-        base_type = int(message.get("type", 0) or 0) & 0x7FFFFFFF
-        if base_type in MEDIA_TYPES:
-            media = await self._download_media(
-                chat_id, int(message.get("localId", 0) or 0)
+        # 下载媒体附件（图片 3、语音 34、视频 43、表情 47、文件 49/6、或表情分享 49/8）
+        should_download_media = msg_type in {
+            MSG_TYPE_IMAGE,
+            MSG_TYPE_VOICE,
+            MSG_TYPE_VIDEO,
+            MSG_TYPE_STICKER,
+        } or (msg_type == MSG_TYPE_APP and app_msg_type in {None, 6, 8})
+        if should_download_media and message_id:
+            media = await self._download_v1_media(
+                thread_id=thread_id,
+                message_id=message_id,
+                msg_type=msg_type,
             )
             if media is not None:
                 path, mime_type, filename = media
@@ -868,8 +1107,132 @@ class AgentWeChatPlatformAdapter(Platform):
                         message_str_parts.append("<media:image>")
                     elif mime_type.startswith("audio/"):
                         message_str_parts.append("<media:audio>")
+                    elif mime_type.startswith("video/"):
+                        message_str_parts.append("<media:video>")
                     else:
                         message_str_parts.append(f"[file:{filename}]")
+
+        if not components:
+            return None
+
+        sender_name = await self._resolve_sender_display_name(
+            thread_id, sender_id, is_group
+        )
+        abm = AstrBotMessage()
+        abm.self_id = self.self_id
+        abm.sender = MessageMember(user_id=sender_id, nickname=sender_name)
+        abm.message = components
+        abm.message_str = "\n".join(part for part in message_str_parts if part).strip()
+        abm.raw_message = {
+            "thread": thread_info,
+            "message": message,
+        }
+        abm.timestamp = _parse_timestamp(
+            cast(str | None, message.get("createdAt") or message.get("timestamp"))
+        )
+        # 若有 serverId，编码为 "{messageId}|{serverId}"，方便下游插件使用 Reply 组件原样发起引用回复
+        abm.message_id = (
+            f"{message_id}|{server_id}"
+            if message_id and server_id
+            else (message_id or f"wechat:{thread_id}:{int(time.time())}")
+        )
+
+        if is_group:
+            abm.type = MessageType.GROUP_MESSAGE
+            abm.group_id = thread_id
+            abm.group = Group(thread_id)
+            abm.group.group_name = str(
+                thread_info.get("displayName")
+                or thread_info.get("name")
+                or thread_id
+            )
+            abm.session_id = thread_id
+        else:
+            abm.type = MessageType.FRIEND_MESSAGE
+            abm.session_id = thread_id if thread_id == "filehelper" else sender_id
+
+        return abm
+
+    async def _download_v1_media(
+        self,
+        *,
+        thread_id: str,
+        message_id: str,
+        msg_type: int,
+    ) -> tuple[str, str, str] | None:
+        try:
+            downloaded = await asyncio.to_thread(
+                self.client.download_message_media,
+                message_id,
+                msg_type=msg_type,
+                quality="best",
+                wait_seconds=MEDIA_WAIT_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[agent_wechat] v1 media download failed for {thread_id} ({message_id}): {exc}"
+            )
+            return None
+
+        if downloaded is None:
+            return None
+
+        raw_bytes, mime_type, filename = downloaded
+        directory = os.path.join(_safe_temp_dir(), "agent_wechat_bridge")
+        os.makedirs(directory, exist_ok=True)
+        safe_chat = re.sub(r"[^A-Za-z0-9_.-]+", "_", thread_id)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename) or "attachment.bin"
+        path = os.path.join(
+            directory, f"{safe_chat}_{int(time.time() * 1000)}_{safe_name}"
+        )
+        with open(path, "wb") as handle:
+            handle.write(raw_bytes)
+        return path, mime_type, filename
+
+    # ------------------------------------------------------------------
+    # Legacy conversion helper kept for unit-test backward compatibility
+    # ------------------------------------------------------------------
+
+    async def _convert_message(
+        self,
+        chat: dict[str, Any],
+        message: dict[str, Any],
+    ) -> AstrBotMessage | None:
+        chat_id = str(chat.get("username") or chat.get("id") or "")
+        sender_id = str(message.get("sender") or message.get("senderId") or chat_id)
+        sender_name = str(
+            message.get("senderName")
+            or sender_id
+            or chat.get("displayName")
+            or chat.get("name")
+            or "WeChat"
+        )
+        is_group = is_group_chat(chat_id) or bool(chat.get("isGroup"))
+        raw_text = str(message.get("content") or message.get("body") or "")
+        is_mentioned = bool(message.get("isMentioned"))
+        if is_group and not is_mentioned:
+            is_mentioned = is_native_mentioned(
+                message.get("mentions")
+                if isinstance(message.get("mentions"), dict)
+                else None,
+                raw_text,
+                self.self_aliases,
+            )
+        if is_group and not bool(self.config.get("require_group_mention", False)):
+            is_mentioned = True
+        normalized_text = (
+            strip_leading_mentions(raw_text) if is_group else raw_text.strip()
+        )
+
+        components: list[Any] = []
+        message_str_parts: list[str] = []
+
+        if is_group and is_mentioned:
+            components.append(At(qq=self.self_id, name="bot"))
+
+        if normalized_text:
+            components.append(Plain(text=normalized_text))
+            message_str_parts.append(normalized_text)
 
         reply = message.get("reply")
         if isinstance(reply, dict) and reply.get("content"):
@@ -891,13 +1254,15 @@ class AgentWeChatPlatformAdapter(Platform):
             "message": message,
         }
         abm.timestamp = _parse_timestamp(cast(str | None, message.get("timestamp")))
-        abm.message_id = f"wechat:{chat_id}:{message.get('localId')}"
+        abm.message_id = f"wechat:{chat_id}:{message.get('localId') or message.get('id')}"
 
         if is_group:
             abm.type = MessageType.GROUP_MESSAGE
             abm.group_id = chat_id
             abm.group = Group(chat_id)
-            abm.group.group_name = str(chat.get("name") or chat_id)
+            abm.group.group_name = str(
+                chat.get("displayName") or chat.get("name") or chat_id
+            )
             abm.session_id = chat_id
         else:
             abm.type = MessageType.FRIEND_MESSAGE
@@ -909,101 +1274,44 @@ class AgentWeChatPlatformAdapter(Platform):
         self,
         *,
         source: str,
-        chat: dict[str, Any],
         message: dict[str, Any],
         session_id: str,
+        chat: dict[str, Any] | None = None,
     ) -> None:
-        chat_id = str(chat.get("username") or chat.get("id") or "")
-        sender_id = str(message.get("sender") or chat_id or "")
-        local_id = int(message.get("localId", 0) or 0)
+        chat_id = str(
+            message.get("threadId")
+            or (chat or {}).get("username")
+            or (chat or {}).get("id")
+            or ""
+        )
+        sender_id = str(
+            message.get("senderId") or message.get("sender") or chat_id or ""
+        )
+        msg_id = str(message.get("id") or message.get("localId") or "")
         raw_type = int(message.get("type", 0) or 0)
         base_type = raw_type & 0x7FFFFFFF
-        mentioned = message.get("isMentioned")
+        mentions = message.get("mentions")
+        mentioned = (
+            mentions.get("self")
+            if isinstance(mentions, dict)
+            else message.get("isMentioned")
+        )
         logger.info(
             "[agent_wechat] inbound accepted "
             f"source={source} "
             f"chat={chat_id} "
             f"sender={sender_id} "
-            f"localId={local_id} "
+            f"id={msg_id} "
             f"type={base_type} "
-            f"isMentioned={mentioned} "
+            f"mentioned={mentioned} "
             f"session={session_id}"
         )
 
-    async def _download_media(
-        self,
-        chat_id: str,
-        local_id: int,
-    ) -> tuple[str, str, str] | None:
-        result: dict[str, Any] | None = None
-        for attempt in range(MEDIA_RETRY_ATTEMPTS):
-            try:
-                candidate = await asyncio.to_thread(
-                    self.client.get_media, chat_id, local_id
-                )
-            except AgentWeChatAPIError as exc:
-                logger.warning(
-                    f"[agent_wechat] media fetch failed for {chat_id}:{local_id}: {exc}"
-                )
-                return None
-            except Exception as exc:
-                logger.warning(
-                    f"[agent_wechat] media fetch error for {chat_id}:{local_id}: {exc}"
-                )
-                return None
-
-            if candidate.get("type") == "unsupported":
-                return None
-            if candidate.get("data"):
-                result = candidate
-                break
-            if attempt < MEDIA_RETRY_ATTEMPTS - 1 and MEDIA_RETRY_INTERVAL_SECONDS > 0:
-                # 上游媒体落库可能有延迟，短暂等待后重试。
-                await asyncio.sleep(MEDIA_RETRY_INTERVAL_SECONDS)
-
-        if result is None:
-            return None
-        encoded = result.get("data")
-        if not encoded:
-            return None
-
-        media_type = str(result.get("type") or "file")
-        media_format = str(result.get("format") or "bin").lower()
-        filename = str(result.get("filename") or f"{local_id}.{media_format}")
-
-        mime_map = {
-            "image": {
-                "png": "image/png",
-                "jpg": "image/jpeg",
-                "jpeg": "image/jpeg",
-                "gif": "image/gif",
-                "webp": "image/webp",
-            },
-            "voice": {
-                "mp3": "audio/mpeg",
-                "wav": "audio/wav",
-                "ogg": "audio/ogg",
-            },
-            "video": {
-                "mp4": "video/mp4",
-            },
-        }
-        mime_type = mime_map.get(media_type, {}).get(
-            media_format, "application/octet-stream"
-        )
-
-        directory = os.path.join(_safe_temp_dir(), "agent_wechat_bridge")
-        os.makedirs(directory, exist_ok=True)
-        path = os.path.join(
-            directory, f"{chat_id.replace('/', '_')}_{local_id}_{filename}"
-        )
-        with open(path, "wb") as handle:
-            handle.write(base64.b64decode(encoded))
-        return path, mime_type, filename
-
     async def handle_msg(self, message: AstrBotMessage) -> None:
         is_group = getattr(message, "type", None) == MessageType.GROUP_MESSAGE
-        chat_id = getattr(message, "group_id", None) if is_group else message.session_id
+        chat_id = (
+            getattr(message, "group_id", None) if is_group else message.session_id
+        )
         event = AgentWeChatMessageEvent(
             message_str=message.message_str,
             message_obj=message,

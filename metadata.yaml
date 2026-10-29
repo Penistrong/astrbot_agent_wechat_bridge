@@ -1,11 +1,11 @@
 name: 'astrbot_agent_wechat_bridge'
 author: 'Codex'
-display_name: '微信代理助手'
-desc: '连实现微信个人号连接astrbot'
-version: '0.3.19'
+display_name: '微信代理助手 (agent-wechat 1.x)'
+desc: '通过 agent-wechat 1.2.0+ Native /v1 HTTP & SSE API 将个人微信接入 AstrBot，支持跨服务器远程互联'
+version: '1.0.0'
 license: 'AGPL-3.0'
-repo: 'https://github.com/JackZhaoooooo/astrbot_agent_wechat_bridge'
-homepage: 'https://github.com/JackZhaoooooo/astrbot_agent_wechat_bridge'
+repo: 'https://github.com/Penistrong/astrbot_agent_wechat_bridge'
+homepage: 'https://github.com/Penistrong/astrbot_agent_wechat_bridge'
 astrbot_version: '>=4.16,<5'
 tags:
   - 'astrbot'
@@ -13,10 +13,10 @@ tags:
   - 'agent-wechat'
   - 'platform-adapter'
 features:
-  - 'Poll unread chats from agent-wechat'
-  - 'Receive direct and group messages'
-  - 'Reply with text, images, files, and audio attachments'
-  - 'Optional allowlists for DM and group senders'
+  - 'Connect to remote agent-wechat 1.2.0+ Native /v1 HTTP & SSE API'
+  - 'Receive direct and group messages with real @mention and quote metadata'
+  - 'Reply with text, images, files, videos, voice notes, shares, and mentions'
+  - 'Remote QR login via /wxauth and status check via /wxstatus'
 keywords:
   - astrbot
   - wechat

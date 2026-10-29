@@ -12,8 +12,8 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
 @register(
     "astrbot_agent_wechat_bridge",
     "Codex",
-    "AstrBot platform adapter for agent-wechat.",
-    "0.3.12",
+    "AstrBot platform adapter for agent-wechat (1.x Native /v1 API).",
+    "1.0.0",
 )
 class AgentWeChatBridgePlugin(Star):
     """加载平台适配器并完成注册。"""
