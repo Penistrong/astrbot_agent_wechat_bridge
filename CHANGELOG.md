@@ -11,7 +11,7 @@
   - 入站消息改为基于 `message.committed` / `message.recalled` 事件驱动，支持原生 `@提及` (`NativeMentions`)、内嵌引用 (`quote`)、链接卡片 (`link`)、位置 (`location`) 与撤回抑制
   - 媒体下载迁移至 `/v1/accounts/{account}/messages/{id}/media` + `POST /media-transfers` 异步任务轮询 + `/media/{assetId}/content`，支持微信 `image/x-wxgf` 预览图降级获取
   - 出站消息迁移至 `POST /v1/accounts/{account}/uploads` (multipart) + `POST /v1/accounts/{account}/sends`（强制携带 `Idempotency-Key` 并在超时后通过 `by-idempotency-key` 恢复查询，避免重复发送）
-  - 支持跨服务器远程部署：`/wxauth` 改为通过远端 `/v1/accounts/{account}/auth/login` 与 `/operations/{id}/qr` 直接拉取 PNG 登录二维码，不再依赖本机安装 `wx` CLI（完美兼容 CentOS Stream 9 `glibc=2.32` 远程连接 Ubuntu 24.04 `agent-wechat`）
+  - 支持跨服务器远程部署：`/wxauth` 改为通过远端 `/v1/accounts/{account}/auth/login` 与 `/operations/{id}/qr` 直接拉取 PNG 登录二维码，不再依赖本机安装 `wx` CLI（兼容 AstrBot 所在服务器 `glibc < 2.36`、远端独立部署 `agent-wechat` 的跨机场景）
   - 新增 `/wxstatus` 指令用于查看远端 `agent-wechat` 守护进程版本与账号在线状态
   - 平台配置新增 `account_id`、`verify_tls`、`read_policy`、`require_group_mention` 及私聊/群聊访问控制策略
 

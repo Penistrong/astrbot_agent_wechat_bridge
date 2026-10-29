@@ -96,7 +96,7 @@ CONFIG_METADATA = {
         "token": {
             "label": "访问令牌 (Bearer Token)",
             "help_text": (
-                "必填。在部署 agent-wechat 的 Ubuntu 服务器上读取 "
+                "必填。在部署 agent-wechat 的服务器上读取 "
                 "~/.local/share/agent-wechat/api-token 或通过 wx tokens create 创建。"
             ),
             "field_type": "str",
@@ -427,7 +427,7 @@ class AgentWeChatPlatformAdapter(Platform):
 
         warn_text = (
             "微信账号尚未登录或已离线（authenticated=false / disconnected），"
-            "请在聊天中发送 /wxauth 获取登录二维码，或在 Ubuntu 服务器执行 wx auth login"
+            "请在聊天中发送 /wxauth 获取登录二维码，或在 agent-wechat 服务器执行 wx auth login"
         )
         logger.warning(f"[agent_wechat] {warn_text}")
 
@@ -532,7 +532,7 @@ class AgentWeChatPlatformAdapter(Platform):
             if "HTTP 401" in err_text or "unauthorized" in err_text.lower():
                 logger.warning(
                     "[agent_wechat] events stream 鉴权失败 (HTTP 401)："
-                    "请检查平台配置的 Bearer Token（在 Ubuntu 服务器查看 "
+                    "请检查平台配置的 Bearer Token（在 agent-wechat 服务器查看 "
                     "~/.local/share/agent-wechat/api-token 或运行 wx tokens create）"
                 )
                 return
