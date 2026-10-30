@@ -222,6 +222,8 @@ class AgentWeChatPlatformAdapter(Platform):
     """以 /v1 SSE 事件流为主触发，增量游标轮询补偿兜底。"""
 
     _active_instances: list["AgentWeChatPlatformAdapter"] = []
+    _global_seen_message_ids: set[str] = set()
+    _global_seen_order: list[str] = []
     _logout_notifier: Callable[[str], Awaitable[None] | None] | None = None
     _logout_warn_interval_seconds: float = LOGIN_PAGE_WARN_INTERVAL_SECONDS
     _logout_warn_max_count: int = 0
@@ -282,7 +284,9 @@ class AgentWeChatPlatformAdapter(Platform):
         self.event_cursor: str = "0"
         self.server_id: str | None = None
         self.consumer_id = f"astrbot-{self.metadata.id}"
+        self.event_lock = asyncio.Lock()
         self.seen_message_ids: set[str] = set()
+        self.in_flight_message_ids: set[str] = set()
         self._seen_message_order: list[str] = []
         self.recalled_keys: set[str] = set()
         self.thread_cache: dict[str, dict[str, Any]] = {}
@@ -340,15 +344,45 @@ class AgentWeChatPlatformAdapter(Platform):
                 self.self_aliases.add(item)
 
     def _remember_seen_message(self, message_id: str) -> None:
-        if not message_id or message_id in self.seen_message_ids:
+        if not message_id:
             return
-        self.seen_message_ids.add(message_id)
-        self._seen_message_order.append(message_id)
-        if len(self._seen_message_order) > 4000:
-            oldest = self._seen_message_order[:1000]
-            del self._seen_message_order[:1000]
-            for item in oldest:
-                self.seen_message_ids.discard(item)
+        if message_id not in self.seen_message_ids:
+            self.seen_message_ids.add(message_id)
+            self._seen_message_order.append(message_id)
+            if len(self._seen_message_order) > 4000:
+                oldest = self._seen_message_order[:1000]
+                del self._seen_message_order[:1000]
+                for item in oldest:
+                    self.seen_message_ids.discard(item)
+        cls = self.__class__
+        if message_id not in cls._global_seen_message_ids:
+            cls._global_seen_message_ids.add(message_id)
+            cls._global_seen_order.append(message_id)
+            if len(cls._global_seen_order) > 8000:
+                oldest_global = cls._global_seen_order[:2000]
+                del cls._global_seen_order[:2000]
+                for item in oldest_global:
+                    cls._global_seen_message_ids.discard(item)
+
+    def _is_message_seen(self, message_id: str) -> bool:
+        if not message_id:
+            return False
+        return (
+            message_id in self.seen_message_ids
+            or message_id in self.in_flight_message_ids
+            or message_id in self.__class__._global_seen_message_ids
+        )
+
+    def _forget_seen_message(self, message_id: str) -> None:
+        if not message_id:
+            return
+        self.seen_message_ids.discard(message_id)
+        with suppress(ValueError):
+            self._seen_message_order.remove(message_id)
+        cls = self.__class__
+        cls._global_seen_message_ids.discard(message_id)
+        with suppress(ValueError):
+            cls._global_seen_order.remove(message_id)
 
     def _state_file_path(self) -> str:
         acct = self.client.account_id or "default"
@@ -464,9 +498,15 @@ class AgentWeChatPlatformAdapter(Platform):
         await super().send_by_session(session, message_chain)
 
     async def run(self) -> None:
+        # 防止插件热重载或配置保存时旧适配器实例残留在后台并存运行
+        for prev in list(self.__class__._active_instances):
+            if prev is not self and prev.metadata.id == self.metadata.id:
+                prev.shutdown_event.set()
+                if prev.ws_task is not None:
+                    prev.ws_task.cancel()
+
         await self._refresh_auth_if_needed()
         self.ws_task = asyncio.create_task(self._run_events_stream())
-        self.sync_event.set()
         try:
             while not self.shutdown_event.is_set():
                 event_triggered = False
@@ -488,10 +528,11 @@ class AgentWeChatPlatformAdapter(Platform):
                         continue
 
                     now_ms = time.time() * 1000
-                    if (
-                        event_triggered
-                        or (now_ms - self.last_full_sync_ms) >= EVENT_SYNC_INTERVAL_MS
-                    ):
+                    should_poll = event_triggered or (
+                        not self.ws_connected
+                        and (now_ms - self.last_full_sync_ms) >= EVENT_SYNC_INTERVAL_MS
+                    )
+                    if should_poll:
                         await self._sync_events_once()
                         self.last_full_sync_ms = now_ms
                 except Exception as exc:
@@ -519,7 +560,6 @@ class AgentWeChatPlatformAdapter(Platform):
 
     async def _on_ws_open(self) -> None:
         self.ws_connected = True
-        self.sync_event.set()
 
     async def _on_ws_close(self) -> None:
         self.ws_connected = False
@@ -540,28 +580,28 @@ class AgentWeChatPlatformAdapter(Platform):
 
     async def _on_ws_message(self, raw_message: str) -> None:
         if not raw_message:
-            self.sync_event.set()
             return
 
         try:
             payload = json.loads(raw_message)
         except json.JSONDecodeError:
-            self.sync_event.set()
             return
 
-        await self._dispatch_ws_payload(payload)
+        async with self.event_lock:
+            await self._dispatch_ws_payload(payload, source="v1-sse")
 
-    async def _dispatch_ws_payload(self, payload: Any) -> None:
+    async def _dispatch_ws_payload(
+        self, payload: Any, *, source: str = "v1-event"
+    ) -> None:
         if self.suppress_inbound_during_relogin:
             return
 
         if isinstance(payload, list):
             for item in payload:
-                await self._dispatch_ws_payload(item)
+                await self._dispatch_ws_payload(item, source=source)
             return
 
         if not isinstance(payload, dict):
-            self.sync_event.set()
             return
 
         if payload.get("sseEvent") == "error" or isinstance(payload.get("error"), dict):
@@ -592,11 +632,10 @@ class AgentWeChatPlatformAdapter(Platform):
             self.last_auth_check = 0
             if cursor.isdigit():
                 self._advance_cursor(cursor)
-            self.sync_event.set()
             return
 
         if event_kind in {"message.committed", "message.recalled"}:
-            await self._handle_native_event(payload)
+            await self._handle_native_event(payload, source=source)
             return
 
         # 兼容直接携带 message 字典的自定义测试事件
@@ -616,7 +655,6 @@ class AgentWeChatPlatformAdapter(Platform):
 
         if cursor.isdigit():
             self._advance_cursor(cursor)
-        self.sync_event.set()
 
     def _advance_cursor(self, new_cursor: str) -> None:
         if not new_cursor or not new_cursor.isdigit():
@@ -635,7 +673,9 @@ class AgentWeChatPlatformAdapter(Platform):
                 self.event_cursor,
             )
 
-    async def _handle_native_event(self, event: dict[str, Any]) -> None:
+    async def _handle_native_event(
+        self, event: dict[str, Any], *, source: str = "v1-event"
+    ) -> None:
         kind = str(event.get("kind") or "")
         cursor = str(event.get("cursor") or "").strip()
         data = event.get("data") if isinstance(event.get("data"), dict) else {}
@@ -667,85 +707,108 @@ class AgentWeChatPlatformAdapter(Platform):
                     await self._ack_current_cursor()
                 return
 
-            if not message_id or message_id in self.seen_message_ids:
+            if not message_id or self._is_message_seen(message_id):
                 if cursor.isdigit():
                     self._advance_cursor(cursor)
                     await self._ack_current_cursor()
                 return
 
-            try:
-                message = await asyncio.to_thread(
-                    self.client.get_message,
-                    message_id,
-                    timeout=HOT_PATH_TIMEOUT_SECONDS,
-                )
-            except AgentWeChatAPIError as exc:
-                if exc.status_code in {404, 410}:
-                    self._remember_seen_message(message_id)
-                    if cursor.isdigit():
-                        self._advance_cursor(cursor)
-                        await self._ack_current_cursor()
-                    return
-                raise
-
+            # 在发起异步 HTTP 拉取前立即登记 message_id，防止 SSE 与轮询协程并发重入导致重复消费
+            self.in_flight_message_ids.add(message_id)
             self._remember_seen_message(message_id)
-            if isinstance(message, dict) and message:
-                converted = await self._convert_native_message(message)
-                if converted is not None:
-                    self._log_inbound_message(
-                        source="v1-event",
-                        message=message,
-                        session_id=converted.session_id,
+            try:
+                try:
+                    message = await asyncio.to_thread(
+                        self.client.get_message,
+                        message_id,
+                        timeout=HOT_PATH_TIMEOUT_SECONDS,
                     )
-                    await self.handle_msg(converted)
-                    thread_id = str(message.get("threadId") or "")
-                    if thread_id:
-                        self._touch_chat(thread_id)
-                        await self._maybe_mark_thread_read(thread_id)
+                except AgentWeChatAPIError as exc:
+                    if exc.status_code in {404, 410}:
+                        if cursor.isdigit():
+                            self._advance_cursor(cursor)
+                            await self._ack_current_cursor()
+                        return
+                    self._forget_seen_message(message_id)
+                    raise
+                except Exception:
+                    self._forget_seen_message(message_id)
+                    raise
 
-            if cursor.isdigit():
-                self._advance_cursor(cursor)
-                await self._ack_current_cursor()
+                if isinstance(message, dict) and message:
+                    thread_id = str(message.get("threadId") or "").strip()
+                    server_id = str(message.get("serverId") or "").strip()
+                    server_dedup_key = (
+                        f"srv:{thread_id}:{server_id}"
+                        if thread_id and server_id
+                        else ""
+                    )
+                    if server_dedup_key and self._is_message_seen(server_dedup_key):
+                        if cursor.isdigit():
+                            self._advance_cursor(cursor)
+                            await self._ack_current_cursor()
+                        return
+                    if server_dedup_key:
+                        self._remember_seen_message(server_dedup_key)
+
+                    converted = await self._convert_native_message(message)
+                    if converted is not None:
+                        self._log_inbound_message(
+                            source=source,
+                            message=message,
+                            session_id=converted.session_id,
+                        )
+                        await self.handle_msg(converted)
+                        if thread_id:
+                            self._touch_chat(thread_id)
+                            await self._maybe_mark_thread_read(thread_id)
+
+                if cursor.isdigit():
+                    self._advance_cursor(cursor)
+                    await self._ack_current_cursor()
+            finally:
+                self.in_flight_message_ids.discard(message_id)
 
     async def _sync_events_once(self) -> None:
         """通过 GET /v1/accounts/{a}/events?after=CURSOR 做增量补偿同步。"""
-        for _ in range(10):
-            if self.shutdown_event.is_set():
-                return
-            try:
-                page = await asyncio.to_thread(
-                    self.client.list_events,
-                    self.event_cursor,
-                    100,
-                    timeout=HOT_PATH_TIMEOUT_SECONDS,
-                )
-            except AgentWeChatAPIError as exc:
-                if exc.code == "event_cursor_expired" or exc.status_code == 410:
-                    logger.warning(
-                        "[agent_wechat] event cursor expired during poll, rebaselining"
-                    )
-                    await self._rebaseline_event_cursor()
-                    return
-                raise
-
-            items = page.get("items") if isinstance(page, dict) else []
-            if not isinstance(items, list) or not items:
-                return
-
-            before = self.event_cursor
-            for item in items:
+        async with self.event_lock:
+            for _ in range(10):
                 if self.shutdown_event.is_set():
                     return
-                if isinstance(item, dict):
-                    await self._dispatch_ws_payload(item)
+                try:
+                    page = await asyncio.to_thread(
+                        self.client.list_events,
+                        self.event_cursor,
+                        100,
+                        timeout=HOT_PATH_TIMEOUT_SECONDS,
+                    )
+                except AgentWeChatAPIError as exc:
+                    if exc.code == "event_cursor_expired" or exc.status_code == 410:
+                        logger.warning(
+                            "[agent_wechat] event cursor expired during poll, rebaselining"
+                        )
+                        await self._rebaseline_event_cursor()
+                        return
+                    raise
 
-            next_cursor = str(page.get("nextCursor") or "").strip()
-            if next_cursor.isdigit():
-                self._advance_cursor(next_cursor)
-                await self._ack_current_cursor()
+                items = page.get("items") if isinstance(page, dict) else []
+                if not isinstance(items, list) or not items:
+                    return
 
-            if len(items) < 100 or self.event_cursor == before:
-                return
+                before = self.event_cursor
+                for item in items:
+                    if self.shutdown_event.is_set():
+                        return
+                    if isinstance(item, dict):
+                        await self._dispatch_ws_payload(item, source="v1-poll")
+
+                next_cursor = str(page.get("nextCursor") or "").strip()
+                if next_cursor.isdigit():
+                    self._advance_cursor(next_cursor)
+                    await self._ack_current_cursor()
+
+                if len(items) < 100 or self.event_cursor == before:
+                    return
 
     async def _refresh_auth_if_needed(self) -> bool:
         now_ms = time.time() * 1000
