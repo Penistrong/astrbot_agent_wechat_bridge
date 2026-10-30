@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import sys
 import tempfile
 import time
 from contextlib import suppress
@@ -210,6 +211,24 @@ def _mime_to_component(path: str, mime_type: str, filename: str):
     return File(name=filename or os.path.basename(path), file=path)
 
 
+_PROCESS_ACTIVE_INSTANCES: list[Any] = getattr(
+    sys, "_agent_wechat_active_instances", None
+)
+if _PROCESS_ACTIVE_INSTANCES is None:
+    _PROCESS_ACTIVE_INSTANCES = []
+    setattr(sys, "_agent_wechat_active_instances", _PROCESS_ACTIVE_INSTANCES)
+
+_PROCESS_SEEN_IDS: set[str] = getattr(sys, "_agent_wechat_global_seen_ids", None)
+if _PROCESS_SEEN_IDS is None:
+    _PROCESS_SEEN_IDS = set()
+    setattr(sys, "_agent_wechat_global_seen_ids", _PROCESS_SEEN_IDS)
+
+_PROCESS_SEEN_ORDER: list[str] = getattr(sys, "_agent_wechat_global_seen_order", None)
+if _PROCESS_SEEN_ORDER is None:
+    _PROCESS_SEEN_ORDER = []
+    setattr(sys, "_agent_wechat_global_seen_order", _PROCESS_SEEN_ORDER)
+
+
 @register_platform_adapter(
     "agent_wechat",
     "WeChat adapter powered by agent-wechat (1.x Native API).",
@@ -221,9 +240,9 @@ def _mime_to_component(path: str, mime_type: str, filename: str):
 class AgentWeChatPlatformAdapter(Platform):
     """以 /v1 SSE 事件流为主触发，增量游标轮询补偿兜底。"""
 
-    _active_instances: list["AgentWeChatPlatformAdapter"] = []
-    _global_seen_message_ids: set[str] = set()
-    _global_seen_order: list[str] = []
+    _active_instances: list["AgentWeChatPlatformAdapter"] = _PROCESS_ACTIVE_INSTANCES
+    _global_seen_message_ids: set[str] = _PROCESS_SEEN_IDS
+    _global_seen_order: list[str] = _PROCESS_SEEN_ORDER
     _logout_notifier: Callable[[str], Awaitable[None] | None] | None = None
     _logout_warn_interval_seconds: float = LOGIN_PAGE_WARN_INTERVAL_SECONDS
     _logout_warn_max_count: int = 0
@@ -500,11 +519,16 @@ class AgentWeChatPlatformAdapter(Platform):
     async def run(self) -> None:
         # 防止插件热重载或配置保存时旧适配器实例残留在后台并存运行
         for prev in list(self.__class__._active_instances):
-            if prev is not self and prev.metadata.id == self.metadata.id:
-                prev.shutdown_event.set()
-                if prev.ws_task is not None:
-                    prev.ws_task.cancel()
+            if prev is not self and getattr(getattr(prev, "metadata", None), "id", None) == self.metadata.id:
+                if hasattr(prev, "shutdown_event"):
+                    prev.shutdown_event.set()
+                prev_ws = getattr(prev, "ws_task", None)
+                if prev_ws is not None:
+                    prev_ws.cancel()
 
+        logger.info(
+            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.1"
+        )
         await self._refresh_auth_if_needed()
         self.ws_task = asyncio.create_task(self._run_events_stream())
         try:

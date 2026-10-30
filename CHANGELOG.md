@@ -2,6 +2,13 @@
 
 本项目遵循“每次版本更新都记录变更”的约定。
 
+## 1.0.1 - 2026-10-30
+
+- **修复 SSE 事件流与 REST 轮询竞态导致的消息重复消费问题**：
+  - 在 `get_message` 异步网络请求前立即登记 `in_flight_message_ids` 与进程级全局去重集合，防止跨机 RTT 窗口期内被并发重入
+  - 引入 `event_lock` 串行化 SSE 推送与 REST 增量轮询事件分发，并在 SSE 在线期间抑制无意义的 `sync_event` 轮询唤醒
+  - 在 `AgentWeChatBridgePlugin.initialize` / `terminate` 中接入 `PlatformManager.reload`，解决 AstrBot 热更新/重载插件时未自动重启后台旧平台适配器实例的问题
+
 ## 1.0.0 - 2026-10-29
 
 - **全面升级适配 `agent-wechat` 1.2.0+ Native `/v1` API**：

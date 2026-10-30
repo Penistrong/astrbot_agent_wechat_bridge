@@ -21,6 +21,11 @@ PLUGIN_ROOT = Path(__file__).resolve().parent
 if str(PLUGIN_ROOT) not in sys.path:
     sys.path.insert(0, str(PLUGIN_ROOT))
 
+# 清理可能残留在顶层命名空间的旧模块缓存，确保插件热重载/更新后总是加载最新代码
+for _mod_name in list(sys.modules.keys()):
+    if _mod_name == "src" or _mod_name.startswith("src.agent_wechat"):
+        sys.modules.pop(_mod_name, None)
+
 try:
     from .src.agent_wechat_client import WeChatClient
     from .src.agent_wechat_platform_adapter import (
@@ -39,7 +44,7 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
     "astrbot_agent_wechat_bridge",
     "Codex",
     "AstrBot platform adapter for agent-wechat (1.x Native /v1 API).",
-    "1.0.0",
+    "1.0.1",
 )
 class AgentWeChatBridgePlugin(Star):
     """加载平台适配器并提供远程登录与状态管理命令。"""
@@ -116,9 +121,59 @@ class AgentWeChatBridgePlugin(Star):
         )
         await self._broadcast_chain(chain)
 
+    async def initialize(self) -> None:
+        """当插件在运行期被更新或热重载时，自动重启 PlatformManager 中的 agent_wechat 实例以加载新代码。"""
+        pm = getattr(self.context, "platform_manager", None)
+        if pm is None:
+            return
+        # 若 platform_insts 为空，说明当前处于 AstrBot 启动早期阶段，后续将由 CoreLifecycle 统一 initialize
+        running_insts = list(getattr(pm, "platform_insts", []) or [])
+        if not running_insts:
+            return
+
+        for inst in running_insts:
+            try:
+                meta = inst.meta() if hasattr(inst, "meta") else None
+                if getattr(meta, "name", None) == "agent_wechat":
+                    if hasattr(inst, "shutdown_event"):
+                        inst.shutdown_event.set()
+                    ws_task = getattr(inst, "ws_task", None)
+                    if ws_task is not None:
+                        ws_task.cancel()
+            except Exception:
+                pass
+
+        for platform_cfg in list(getattr(pm, "platforms_config", []) or []):
+            if not isinstance(platform_cfg, dict):
+                continue
+            if platform_cfg.get("type") == "agent_wechat" and platform_cfg.get("enable"):
+                try:
+                    await pm.reload(platform_cfg)
+                    logger.info(
+                        f"[agent_wechat] 已随插件热重载同步重启平台适配器: id={platform_cfg.get('id')} (v1.0.1)"
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        f"[agent_wechat] 热重载平台适配器 {platform_cfg.get('id')} 失败: {exc}"
+                    )
+
     async def terminate(self) -> None:
         AgentWeChatPlatformAdapter.set_logout_notifier(None)
         AgentWeChatPlatformAdapter.reset_logout_warning_state()
+        pm = getattr(self.context, "platform_manager", None)
+        if pm is None:
+            return
+        for inst in list(getattr(pm, "platform_insts", []) or []):
+            try:
+                meta = inst.meta() if hasattr(inst, "meta") else None
+                if getattr(meta, "name", None) == "agent_wechat":
+                    if hasattr(inst, "shutdown_event"):
+                        inst.shutdown_event.set()
+                    ws_task = getattr(inst, "ws_task", None)
+                    if ws_task is not None:
+                        ws_task.cancel()
+            except Exception:
+                pass
 
     @filter.command("wxstatus")
     async def wxstatus(self, event: AstrMessageEvent):
