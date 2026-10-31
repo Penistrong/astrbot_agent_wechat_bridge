@@ -37,7 +37,9 @@ def test_question_breaks_through_cold_group() -> None:
     assert "提问" in reason
 
 
-def test_cooldown_blocks_repeat() -> None:
+def test_cooldown_blocks_repeat(monkeypatch) -> None:
+    # 概率封顶 0.6，不固定 random 会偶发掷不中
+    monkeypatch.setattr("src.agent_wechat_autojoin.random.random", lambda: 0.0)
     gate = _gate(6)
     params = dict(BASE, base_possibility=1.0, self_silence_seconds=0)
     first, _ = gate.decide(UMO, **params)
