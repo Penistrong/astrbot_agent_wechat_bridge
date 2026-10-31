@@ -15,7 +15,10 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import EventMessageType
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
+from astrbot.core.platform.message_type import MessageType
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 if str(PLUGIN_ROOT) not in sys.path:
@@ -28,11 +31,13 @@ for _mod_name in list(sys.modules.keys()):
 
 try:
     from .src.agent_wechat_client import WeChatClient
+    from .src.agent_wechat_autojoin import AutoJoinGate, looks_like_question
     from .src.agent_wechat_platform_adapter import (
         AgentWeChatPlatformAdapter as _AgentWeChatPlatformAdapter,
     )
 except ImportError:
     from src.agent_wechat_client import WeChatClient
+    from src.agent_wechat_autojoin import AutoJoinGate, looks_like_question
     from src.agent_wechat_platform_adapter import (
         AgentWeChatPlatformAdapter as _AgentWeChatPlatformAdapter,
     )
@@ -52,6 +57,8 @@ class AgentWeChatBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None) -> None:
         super().__init__(context)
         self.config = config or AstrBotConfig()
+        self._auto_join = AutoJoinGate()
+        self._tts_disabled_umos: set[str] = set()
         AgentWeChatPlatformAdapter.set_logout_notifier(self._notify_logout)
         AgentWeChatPlatformAdapter.set_logout_notify_policy(
             interval_seconds=self._get_logout_notify_interval_seconds(),
@@ -174,6 +181,123 @@ class AgentWeChatBridgePlugin(Star):
                         ws_task.cancel()
             except Exception:
                 pass
+
+    @filter.on_llm_request(priority=100)
+    async def inject_active_reply_style(
+        self, event: AstrMessageEvent, req: ProviderRequest
+    ) -> None:
+        """群聊「主动接话」时补一段提示，让它像群友而不是客服。
+
+        内核的 active_reply 只用 `event.message_str` 当 prompt，而且它的配置
+        结构里根本没有 prompt 字段（core/config/default.py 的 active_reply 只有
+        enable/method/possibility_reply/whitelist，存进去也会被 schema 清洗掉）。
+        口吻提示因此放在插件配置里。主动接话的请求特征是「群消息 + 未被 @/唤醒」，
+        正常被叫的回复 is_at_or_wake_command 为 True，不受影响。
+        """
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+        if event.is_at_or_wake_command:
+            return
+        style_prompt = str(self.config.get("auto_join_prompt") or "").strip()
+        if not style_prompt:
+            try:
+                style_prompt = str(
+                    self.context.get_config(umo=event.unified_msg_origin)[
+                        "provider_ltm_settings"
+                    ]["active_reply"].get("prompt")
+                    or ""
+                ).strip()
+            except (KeyError, TypeError):
+                style_prompt = ""
+        if not style_prompt:
+            return
+        req.system_prompt = f"{req.system_prompt}\n\n{style_prompt}".strip()
+
+    async def _disable_tts_for_group(self, umo: str) -> None:
+        """把群会话的 TTS 关掉（每个 umo 只写一次）。
+
+        内核结果是先 TTS 再发送，一次合成十几到几十秒，群里等着看字的人只会以为它没回。
+        """
+        if umo in self._tts_disabled_umos:
+            return
+        self._tts_disabled_umos.add(umo)
+        try:
+            from astrbot.core.star.session_llm_manager import SessionServiceManager
+
+            await SessionServiceManager.set_tts_status_for_session(umo, False)
+        except Exception as exc:  # 老版本没有这个接口就当没这回事
+            logger.debug(f"[autojoin] 关闭群 TTS 失败 umo={umo}: {exc}")
+
+    def _auto_join_setting(self, key: str, default: float) -> float:
+        try:
+            value = float(self.config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return max(0.0, value)
+
+    @filter.event_message_type(EventMessageType.GROUP_MESSAGE)
+    async def auto_join_group_chat(self, event: AstrMessageEvent):
+        """按群热度决定要不要主动接话，替代内核那条固定概率判定。
+
+        内核的 need_active_reply 只看 `random() < possibility`，冷场也掷、
+        自己刚说完话也掷。这里先看最近一分钟的群消息热度，过了冷场线、
+        冷却期和自身静默期才掷骰。
+        """
+        umo = event.unified_msg_origin
+        self._auto_join.observe(umo)
+        # 关 TTS 要放在 @ 判断之前：被 @ 的那条同样不该回语音
+        await self._disable_tts_for_group(umo)
+
+        if event.is_at_or_wake_command:
+            return
+        text = (event.message_str or "").strip()
+        if not text or text.startswith("/"):
+            return
+
+        if not self.config.get("auto_join_enable", True):
+            return
+        try:
+            active_reply = self.context.get_config(umo=umo)["provider_ltm_settings"][
+                "active_reply"
+            ]
+        except (KeyError, TypeError):
+            return
+
+        should_join, reason = self._auto_join.decide(
+            umo,
+            base_possibility=float(active_reply.get("possibility_reply") or 0),
+            min_hotness=int(self._auto_join_setting("auto_join_min_hotness", 3)),
+            cooldown_seconds=self._auto_join_setting(
+                "auto_join_cooldown_seconds", 90
+            ),
+            self_silence_seconds=self._auto_join_setting(
+                "auto_join_self_silence_seconds", 45
+            ),
+            question=looks_like_question(text),
+        )
+        logger.debug(f"[autojoin] {umo} → {reason}")
+        if not should_join:
+            return
+
+        conv_id = await self.context.conversation_manager.get_curr_conversation_id(umo)
+        if not conv_id:
+            logger.debug(f"[autojoin] {umo} 没有当前会话，跳过")
+            return
+        conversation = await self.context.conversation_manager.get_conversation(
+            umo, conv_id
+        )
+        if conversation is None:
+            return
+        yield event.request_llm(
+            prompt=text,
+            session_id=event.session_id,
+            conversation=conversation,
+        )
+
+    @filter.after_message_sent()
+    async def mark_group_self_spoke(self, event: AstrMessageEvent) -> None:
+        """每次发言后记一笔，免得刚回完话又被接话闸门放过去。"""
+        self._auto_join.mark_self_spoke(event.unified_msg_origin)
 
     @filter.command("wxstatus")
     async def wxstatus(self, event: AstrMessageEvent):

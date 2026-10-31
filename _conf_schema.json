@@ -15,5 +15,35 @@
     "description": "发送间隔时间",
     "hint": "单位秒",
     "default": 900
+  },
+  "auto_join_enable": {
+    "type": "bool",
+    "description": "群聊按热度主动接话",
+    "hint": "开启后热闹时可能插一句；内核 active_reply 的纯概率判定会被本插件接管",
+    "default": true
+  },
+  "auto_join_min_hotness": {
+    "type": "int",
+    "description": "冷场阈值（最近一分钟最少消息数）",
+    "hint": "不足这个数就当冷场，不接话",
+    "default": 3
+  },
+  "auto_join_cooldown_seconds": {
+    "type": "float",
+    "description": "两次接话的最小间隔",
+    "hint": "单位秒",
+    "default": 90
+  },
+  "auto_join_self_silence_seconds": {
+    "type": "float",
+    "description": "自己发言后的静默时间",
+    "hint": "单位秒，避免刚回完又追一句",
+    "default": 45
+  },
+  "auto_join_prompt": {
+    "type": "text",
+    "description": "主动接话的口吻提示",
+    "hint": "只在主动接话时追加到系统提示；被 @ 的正常回复不受影响",
+    "default": "你是这个群里的普通成员，不是客服。看到大家聊的内容，挑能接上的点随口说一两句：口语、简短、有自己的态度。不要问候，不要总结，不要解释自己在做什么，不要客套或客服腔，也不要每条都反问。信息不够就只说一句很短的看法。"
   }
 }

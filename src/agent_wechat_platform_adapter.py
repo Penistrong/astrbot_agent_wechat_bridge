@@ -1090,6 +1090,22 @@ class AgentWeChatPlatformAdapter(Platform):
         )
         was_mentioned = is_native_mentioned(mentions_obj, raw_text, self.self_aliases)
 
+        # 微信的「引用」不会带 at，但引用机器人自己的消息就是在对机器人说话。
+        # 只放行这一种引用，不放开成「任何引用都转发」，否则又回到群消息全触发的状态。
+        quoted_self = False
+        quote_obj = message.get("quote")
+        if (
+            is_group
+            and isinstance(quote_obj, dict)
+            and quote_obj.get("state") != "recalled"
+        ):
+            quoted_from = str(quote_obj.get("senderId") or "").strip()
+            quoted_self = bool(quoted_from) and (
+                quoted_from == self.self_id
+                or quoted_from in self.self_aliases
+                or self._normalize_alias(quoted_from) in self.self_aliases
+            )
+
         require_mention = bool(self.config.get("require_group_mention", False))
         dm_policy = str(self.config.get("dm_policy") or "open")
         dm_allowlist = normalize_allowlist(self.config.get("dm_allowlist"))
@@ -1105,7 +1121,7 @@ class AgentWeChatPlatformAdapter(Platform):
         allowed, _ = should_forward_message(
             is_group=is_group,
             sender_id=effective_group_sender,
-            was_mentioned=was_mentioned,
+            was_mentioned=was_mentioned or quoted_self,
             require_mention=require_mention,
             dm_policy=dm_policy,
             dm_allowlist=dm_allowlist,
@@ -1141,7 +1157,10 @@ class AgentWeChatPlatformAdapter(Platform):
                 )
                 message_str_parts.append(f"[引用 {q_sender}: {q_text[:120]}]")
 
-        if is_group and (was_mentioned or not require_mention):
+        # 只有真的被 @ 才注入 At。require_mention=False 的语义是「把群消息放行到
+        # 框架」（让群聊上下文与主动接话能看到消息），不是「把每条消息都当成在叫机器人」。
+        # 否则 AstrBot 的唤醒判定会把每条群消息都当成被 @，于是每条都回。
+        if is_group and was_mentioned:
             components.append(At(qq=self.self_id, name="bot"))
 
         # 位置消息 (48)

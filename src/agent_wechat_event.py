@@ -9,6 +9,7 @@ import inspect
 import mimetypes
 import os
 import re
+import subprocess
 import time
 import unicodedata
 from collections.abc import AsyncGenerator
@@ -138,6 +139,81 @@ async def _segment_to_dict(seg: Any) -> dict[str, Any] | None:
     if isinstance(serialized, dict):
         return serialized
     return None
+
+
+VOICE_SEND_GAP_SECONDS = 0.8
+VOICE_MAX_SECONDS = 55.0  # 微信语音条上限 60s，留 5s 余量
+
+
+def _probe_duration(path: str) -> float:
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        return float((out.stdout or "").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _silence_cuts(path: str, threshold_db: int = -35, min_silence: float = 0.35) -> list[float]:
+    """静音区间的中点时间列表，用于把长语音切在换气处而不是句子中间。"""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-i", path, "-af",
+             f"silencedetect=noise={threshold_db}dB:d={min_silence}", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=180,
+        )
+        text = out.stderr or ""
+    except Exception:
+        return []
+    starts = [float(v) for v in re.findall(r"silence_start:\s*(-?[0-9.]+)", text)]
+    ends = [float(v) for v in re.findall(r"silence_end:\s*([0-9.]+)", text)]
+    return sorted((a + b) / 2.0 for a, b in zip(starts, ends) if b > a)
+
+
+def _split_voice_for_wechat(path: str, max_seconds: float = VOICE_MAX_SECONDS) -> list[str]:
+    """超过微信语音上限时切成多段；切点优先取静音处，找不到才硬切。"""
+    if not os.path.isfile(path):
+        return [path]
+    duration = _probe_duration(path)
+    if duration <= max_seconds + 0.5:
+        return [path]
+
+    cuts = _silence_cuts(path)
+    bounds: list[tuple[float, float]] = []
+    cursor = 0.0
+    while duration - cursor > max_seconds:
+        hard = cursor + max_seconds
+        window = [c for c in cuts if cursor + max_seconds * 0.4 < c <= hard]
+        edge = window[-1] if window else hard
+        bounds.append((cursor, edge))
+        cursor = edge
+    bounds.append((cursor, duration))
+
+    out_dir = os.path.join(os.path.dirname(path), "voice_split")
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(path))[0]
+    parts: list[str] = []
+    for idx, (start, end) in enumerate(bounds, 1):
+        out = os.path.join(out_dir, f"{base}_part{idx}.wav")
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+             "-ss", f"{start:.3f}", "-to", f"{end:.3f}",
+             "-c:a", "pcm_s16le", out],  # 保持原采样率，重采样会削高频导致失真
+            capture_output=True, timeout=180,
+        )
+        if os.path.exists(out) and os.path.getsize(out) > 1000:
+            parts.append(out)
+        else:
+            logger.warning(f"{SEND_LOG_PREFIX} 语音切片失败 idx={idx} {start:.1f}-{end:.1f}s")
+    if len(parts) <= 1:
+        return [path]
+    logger.info(
+        f"{SEND_LOG_PREFIX} 语音 {duration:.1f}s 超过 {max_seconds:.0f}s，切成 {len(parts)} 段"
+    )
+    return parts
 
 
 def _load_binary_from_path(
@@ -551,27 +627,39 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
                             resolved_source = converted_path
                     except Exception:
                         pass
-                data, mime_type, filename = await asyncio.to_thread(
-                    _load_binary_from_path, resolved_source, 30, "audio/wav"
+                # 微信语音条上限 60s：超长音频切成多段，逐条发送
+                voice_parts = await asyncio.to_thread(
+                    _split_voice_for_wechat, resolved_source
                 )
-                safe_filename = _sanitize_filename(
-                    str(getattr(component, "name", None) or filename or "voice.wav")
+                base_name = str(
+                    getattr(component, "name", None) or "voice.wav"
                 )
                 flush_text_only()
-                payloads.append(
-                    {
-                        "chatId": chat_id,
-                        "file": {
-                            "data": base64.b64encode(data).decode("utf-8"),
-                            "filename": safe_filename,
-                        },
-                        "voice": {
-                            "data": base64.b64encode(data).decode("utf-8"),
-                            "filename": safe_filename,
-                            "mimeType": mime_type or "audio/wav",
-                        },
-                    }
-                )
+                for part_index, part_path in enumerate(voice_parts, 1):
+                    data, mime_type, filename = await asyncio.to_thread(
+                        _load_binary_from_path, part_path, 30, "audio/wav"
+                    )
+                    if len(voice_parts) > 1:
+                        stem, ext = os.path.splitext(
+                            _sanitize_filename(base_name, "voice.wav")
+                        )
+                        safe_filename = f"{stem}_{part_index}{ext or '.wav'}"
+                    else:
+                        safe_filename = _sanitize_filename(
+                            str(getattr(component, "name", None) or filename or "voice.wav")
+                        )
+                    encoded = base64.b64encode(data).decode("utf-8")
+                    payloads.append(
+                        {
+                            "chatId": chat_id,
+                            "file": {"data": encoded, "filename": safe_filename},
+                            "voice": {
+                                "data": encoded,
+                                "filename": safe_filename,
+                                "mimeType": mime_type or "audio/wav",
+                            },
+                        }
+                    )
                 continue
 
             if isinstance(component, (File, Video)):
@@ -726,6 +814,9 @@ class AgentWeChatMessageEvent(AstrMessageEvent):
             return
 
         for idx, payload in enumerate(filtered_payloads):
+            # 长语音被切成多条时给微信留点间隔，避免连发触发风控 / 顺序错乱
+            if idx > 0 and "voice" in payload:
+                await asyncio.sleep(VOICE_SEND_GAP_SECONDS)
             try:
                 result = await asyncio.to_thread(
                     client.send_message,
