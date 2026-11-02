@@ -85,70 +85,81 @@ MEDIA_WAIT_TIMEOUT_SECONDS = 25.0
 SELF_ID_ALIAS_RE = re.compile(r"^(wxid_[^_]+)(?:_[0-9a-fA-F]{4,})$")
 
 CONFIG_METADATA = {
+    "server_url": {
+        "description": "服务地址 (server_url)",
+        "type": "string",
+        "hint": (
+            "agent-wechat (1.x) 的 HTTP/HTTPS API 地址，例如 "
+            "http://127.0.0.1:6174 或 https://wechat.example.com。"
+        ),
+    },
+    "account_id": {
+        "description": "微信账号 ID (account_id)",
+        "type": "string",
+        "hint": (
+            "可选。执行 wx accounts list 查看 id 或 alias；留空则自动选择第一个已认证账号。"
+        ),
+    },
+    "verify_tls": {
+        "description": "校验 HTTPS 证书 (verify_tls)",
+        "type": "bool",
+        "hint": "跨服务器使用自签名证书连接 agent-wechat 时请保持关闭 (false)。",
+    },
+    "read_policy": {
+        "description": "已读回执策略 (read_policy)",
+        "type": "string",
+        "options": ["on_inbound", "never"],
+        "labels": ["收到消息后标记已读 (on_inbound)", "保持未读状态 (never)"],
+        "hint": "on_inbound: 收到并投递给 AstrBot 后标记会话已读；never: 不修改微信未读状态。",
+    },
+    "require_group_mention": {
+        "description": "群聊仅转发 @机器人 的消息",
+        "type": "bool",
+        "hint": "开启后仅在 @机器人 或引用机器人消息时才将群消息投递给 AstrBot；关闭则放行所有群消息（供群聊上下文记录与主动回复判定）。",
+    },
+    "dm_policy": {
+        "description": "私聊访问策略 (dm_policy)",
+        "type": "string",
+        "options": ["open", "allowlist", "disabled"],
+        "labels": ["开放所有私聊 (open)", "仅限白名单 (allowlist)", "禁用私聊 (disabled)"],
+        "hint": "open: 允许所有私聊；allowlist: 仅允许白名单；disabled: 禁用私聊。",
+    },
+    "dm_allowlist": {
+        "description": "私聊白名单 (dm_allowlist)",
+        "type": "list",
+        "hint": "当私聊策略为 allowlist 时生效，填写允许的 wxid 列表。",
+    },
+    "group_policy": {
+        "description": "群聊访问策略 (group_policy)",
+        "type": "string",
+        "options": ["open", "allowlist", "disabled"],
+        "labels": ["开放所有群聊 (open)", "仅限白名单 (allowlist)", "禁用群聊 (disabled)"],
+        "hint": "open: 允许所有群聊；allowlist: 仅允许白名单发送者/群；disabled: 禁用群聊。",
+    },
+    "group_allowlist": {
+        "description": "群聊白名单 (group_allowlist)",
+        "type": "list",
+        "hint": "当群聊策略为 allowlist 时生效，可填写群 ID (xxx@chatroom) 或发送者 wxid。",
+    },
+}
+
+I18N_RESOURCES = {
+    "zh-CN": {
+        key: {
+            k: v
+            for k, v in val.items()
+            if k in ("description", "hint", "labels")
+        }
+        for key, val in CONFIG_METADATA.items()
+    },
     "en-US": {
-        "server_url": {
-            "label": "服务地址",
-            "help_text": (
-                "agent-wechat (1.x) 的 HTTP/HTTPS API 地址，例如 "
-                "http://192.168.1.100:6174 或 https://192.168.1.100:7443。"
-            ),
-            "field_type": "str",
-        },
-        "token": {
-            "label": "访问令牌 (Bearer Token)",
-            "help_text": (
-                "必填。在部署 agent-wechat 的服务器上读取 "
-                "~/.local/share/agent-wechat/api-token 或通过 wx tokens create 创建。"
-            ),
-            "field_type": "str",
-            "secret": True,
-        },
-        "account_id": {
-            "label": "微信账号 ID (accountId)",
-            "help_text": (
-                "可选。执行 wx accounts list 查看 id 或 alias；留空则自动选择第一个已登录账号。"
-            ),
-            "field_type": "str",
-        },
-        "verify_tls": {
-            "label": "校验 HTTPS 证书",
-            "help_text": "跨服务器使用自签名证书连接 agent-wechat networkListen (7443) 时可设为 false。",
-            "field_type": "bool",
-        },
-        "read_policy": {
-            "label": "已读回执策略",
-            "help_text": "on_inbound: 收到并投递给 AstrBot 后标记会话已读；never: 不修改微信未读状态。",
-            "field_type": "str",
-            "options": ["on_inbound", "never"],
-        },
-        "require_group_mention": {
-            "label": "群聊仅转发 @机器人 的消息",
-            "help_text": "开启后仅在 @机器人 或引用机器人消息时才将群消息投递给 AstrBot；关闭则放行所有群消息（供群聊上下文记录与主动回复判定）。",
-            "field_type": "bool",
-        },
-        "dm_policy": {
-            "label": "私聊访问策略",
-            "help_text": "open: 允许所有私聊；allowlist: 仅允许白名单；disabled: 禁用私聊。",
-            "field_type": "str",
-            "options": ["open", "allowlist", "disabled"],
-        },
-        "dm_allowlist": {
-            "label": "私聊白名单",
-            "help_text": "当私聊策略为 allowlist 时生效，填写允许的 wxid 列表。",
-            "field_type": "list",
-        },
-        "group_policy": {
-            "label": "群聊访问策略",
-            "help_text": "open: 允许所有群聊；allowlist: 仅允许白名单发送者/群；disabled: 禁用群聊。",
-            "field_type": "str",
-            "options": ["open", "allowlist", "disabled"],
-        },
-        "group_allowlist": {
-            "label": "群聊白名单",
-            "help_text": "当群聊策略为 allowlist 时生效，可填写群 ID (xxx@chatroom) 或发送者 wxid。",
-            "field_type": "list",
-        },
-    }
+        key: {
+            k: v
+            for k, v in val.items()
+            if k in ("description", "hint", "labels")
+        }
+        for key, val in CONFIG_METADATA.items()
+    },
 }
 
 DEFAULT_CONFIG = {
@@ -234,7 +245,9 @@ if _PROCESS_SEEN_ORDER is None:
     "WeChat adapter powered by agent-wechat (1.x Native API).",
     default_config_tmpl=DEFAULT_CONFIG,
     support_streaming_message=False,
+    logo_path="../logo.png",
     config_metadata=CONFIG_METADATA,
+    i18n_resources=I18N_RESOURCES,
     adapter_display_name="Agent WeChat",
 )
 class AgentWeChatPlatformAdapter(Platform):
@@ -527,7 +540,7 @@ class AgentWeChatPlatformAdapter(Platform):
                     prev_ws.cancel()
 
         logger.info(
-            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.1"
+            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.2"
         )
         await self._refresh_auth_if_needed()
         self.ws_task = asyncio.create_task(self._run_events_stream())
