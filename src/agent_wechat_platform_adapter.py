@@ -324,6 +324,8 @@ class AgentWeChatPlatformAdapter(Platform):
         self.thread_cache: dict[str, dict[str, Any]] = {}
         self.contact_cache: dict[str, dict[str, Any]] = {}
         self.group_member_cache: dict[str, dict[str, str]] = {}
+        self.recent_sender_media: dict[tuple[str, str], list[tuple[float, str, str, str]]] = {}
+        self.recent_server_media: dict[tuple[str, str], tuple[float, str, str, str]] = {}
         self.last_auth_check = 0.0
         self.last_auth_status: str | None = None
         self.last_login_page_warn_at = 0.0
@@ -540,7 +542,7 @@ class AgentWeChatPlatformAdapter(Platform):
                     prev_ws.cancel()
 
         logger.info(
-            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.2"
+            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.3"
         )
         await self._refresh_auth_if_needed()
         self.ws_task = asyncio.create_task(self._run_events_stream())
@@ -1137,7 +1139,32 @@ class AgentWeChatPlatformAdapter(Platform):
             if is_group and thread_id in group_allowlist
             else sender_id
         )
-        allowed, _ = should_forward_message(
+
+        # 判断是否为包含媒体的消息（图片 3、语音 34、视频 43、表情 47、文件/表情分享 49/6,8，或引用图片/表情 49/57）
+        quote = message.get("quote") if isinstance(message.get("quote"), dict) else None
+        quote_has_media = bool(
+            quote
+            and quote.get("state") != "recalled"
+            and (
+                quote.get("embeddedImage") is True
+                or quote.get("embeddedSticker") is True
+                or quote.get("type") in {MSG_TYPE_IMAGE, MSG_TYPE_STICKER}
+            )
+        )
+        is_direct_media_msg = msg_type in {
+            MSG_TYPE_IMAGE,
+            MSG_TYPE_VOICE,
+            MSG_TYPE_VIDEO,
+            MSG_TYPE_STICKER,
+        } or (msg_type == MSG_TYPE_APP and app_msg_type in {None, 6, 8})
+        should_download_media = is_direct_media_msg or quote_has_media
+        effective_media_type = (
+            int(quote.get("type") or MSG_TYPE_IMAGE)
+            if (quote_has_media and not is_direct_media_msg and quote)
+            else msg_type
+        )
+
+        allowed, reject_reason = should_forward_message(
             is_group=is_group,
             sender_id=effective_group_sender,
             was_mentioned=was_mentioned or quoted_self,
@@ -1148,6 +1175,29 @@ class AgentWeChatPlatformAdapter(Platform):
             group_allowlist=group_allowlist,
         )
         if not allowed:
+            # 微信中图片/表情消息无法附带 @提及。当开启 require_group_mention 时，
+            # 若群成员在允许的群中先发了图片/表情，先将其下载并缓存（供紧接着的 @机器人 或引用消息自动挂载）。
+            if (
+                is_group
+                and reject_reason == "mention_required"
+                and message_id
+                and (
+                    msg_type in {MSG_TYPE_IMAGE, MSG_TYPE_STICKER}
+                    or (msg_type == MSG_TYPE_APP and app_msg_type == 8)
+                )
+            ):
+                media = await self._download_v1_media(
+                    thread_id=thread_id,
+                    message_id=message_id,
+                    msg_type=msg_type,
+                )
+                if media is not None:
+                    self._cache_recent_media(
+                        thread_id=thread_id,
+                        sender_id=sender_id,
+                        server_id=server_id,
+                        media=media,
+                    )
             return None
 
         normalized_text = (
@@ -1158,23 +1208,30 @@ class AgentWeChatPlatformAdapter(Platform):
         message_str_parts: list[str] = []
 
         # 引用回复 (49/57 或携带 quote 对象)
-        quote = message.get("quote")
         if isinstance(quote, dict) and quote.get("state") != "recalled":
             q_sender = str(quote.get("senderId") or "unknown")
             q_text = str(quote.get("embeddedText") or "").strip()
             q_srv_id = str(quote.get("serverId") or "")
-            if q_text:
+            q_type = int(quote.get("type") or 0)
+            q_display = q_text or (
+                "[图片]"
+                if q_type == MSG_TYPE_IMAGE or quote.get("embeddedImage")
+                else "[表情]"
+                if q_type == MSG_TYPE_STICKER or quote.get("embeddedSticker")
+                else ""
+            )
+            if q_display:
                 components.append(
                     Reply(
                         id=q_srv_id or message_id,
-                        chain=[Plain(text=q_text)],
+                        chain=[Plain(text=q_display)],
                         sender_id=self.self_id if quoted_self else q_sender,
                         sender_nickname=q_sender,
-                        message_str=q_text,
-                        text=q_text,
+                        message_str=q_display,
+                        text=q_display,
                     )
                 )
-                message_str_parts.append(f"[引用 {q_sender}: {q_text[:120]}]")
+                message_str_parts.append(f"[引用 {q_sender}: {q_display[:120]}]")
 
         # 只有真的被 @ 或引用机器人自己的消息时才注入 At。require_mention=False 的语义是
         # 「把群消息放行到框架」（让群聊上下文与主动回复能看到消息），不是「把每条消息都当成在叫机器人」。
@@ -1210,31 +1267,64 @@ class AgentWeChatPlatformAdapter(Platform):
             components.append(Plain(text=normalized_text))
             message_str_parts.append(normalized_text)
 
-        # 下载媒体附件（图片 3、语音 34、视频 43、表情 47、文件 49/6、或表情分享 49/8）
-        should_download_media = msg_type in {
-            MSG_TYPE_IMAGE,
-            MSG_TYPE_VOICE,
-            MSG_TYPE_VIDEO,
-            MSG_TYPE_STICKER,
-        } or (msg_type == MSG_TYPE_APP and app_msg_type in {None, 6, 8})
+        # 下载媒体附件（含直接媒体消息，以及引用了图片/表情的回复消息）
+        media: tuple[str, str, str] | None = None
         if should_download_media and message_id:
             media = await self._download_v1_media(
                 thread_id=thread_id,
                 message_id=message_id,
-                msg_type=msg_type,
+                msg_type=effective_media_type,
             )
-            if media is not None:
-                path, mime_type, filename = media
-                components.append(_mime_to_component(path, mime_type, filename))
-                if not normalized_text:
-                    if mime_type.startswith("image/"):
-                        message_str_parts.append("<media:image>")
-                    elif mime_type.startswith("audio/"):
-                        message_str_parts.append("<media:audio>")
-                    elif mime_type.startswith("video/"):
-                        message_str_parts.append("<media:video>")
-                    else:
-                        message_str_parts.append(f"[file:{filename}]")
+            if media is not None and is_direct_media_msg:
+                self._cache_recent_media(
+                    thread_id=thread_id,
+                    sender_id=sender_id,
+                    server_id=server_id,
+                    media=media,
+                )
+
+        # 若引用了群内近期图片/表情但父消息直接取图未命中，从本地近期媒体缓存按 serverId 兜底
+        if media is None and isinstance(quote, dict):
+            q_srv_id = str(quote.get("serverId") or "").strip()
+            if q_srv_id:
+                media = self._get_cached_media_by_server_id(thread_id, q_srv_id)
+
+        # 若群友先发了图片、紧接着在 90 秒内发了 @机器人 的提问，自动将刚发的图片挂载到当前唤醒轮次
+        if (
+            media is None
+            and is_group
+            and (was_mentioned or quoted_self)
+            and not is_direct_media_msg
+        ):
+            media = self._pop_recent_sender_media(thread_id, sender_id)
+
+        if media is not None:
+            path, mime_type, filename = media
+            components.append(_mime_to_component(path, mime_type, filename))
+            if not normalized_text:
+                if mime_type.startswith("image/"):
+                    message_str_parts.append("<media:image>")
+                elif mime_type.startswith("audio/"):
+                    message_str_parts.append("<media:audio>")
+                elif mime_type.startswith("video/"):
+                    message_str_parts.append("<media:video>")
+                else:
+                    message_str_parts.append(f"[file:{filename}]")
+        elif is_direct_media_msg and not normalized_text:
+            # 媒体下载失败时保留占位文本，避免整条消息因 components 为空而凭空消失
+            placeholder = (
+                "[表情]"
+                if (msg_type == MSG_TYPE_STICKER or app_msg_type == 8)
+                else "[图片]"
+                if msg_type == MSG_TYPE_IMAGE
+                else "[语音]"
+                if msg_type == MSG_TYPE_VOICE
+                else "[视频]"
+                if msg_type == MSG_TYPE_VIDEO
+                else "[文件]"
+            )
+            components.append(Plain(text=placeholder))
+            message_str_parts.append(placeholder)
 
         if not components:
             return None
@@ -1277,6 +1367,81 @@ class AgentWeChatPlatformAdapter(Platform):
 
         return abm
 
+    def _prune_recent_media_caches(self, now: float | None = None) -> None:
+        current = now if now is not None else time.monotonic()
+        ttl = 120.0
+        for key, items in list(self.recent_sender_media.items()):
+            kept = [item for item in items if current - item[0] <= ttl and os.path.exists(item[1])]
+            if kept:
+                self.recent_sender_media[key] = kept[-3:]
+            else:
+                self.recent_sender_media.pop(key, None)
+
+        for key, item in list(self.recent_server_media.items()):
+            if current - item[0] > ttl or not os.path.exists(item[1]):
+                self.recent_server_media.pop(key, None)
+
+    def _cache_recent_media(
+        self,
+        *,
+        thread_id: str,
+        sender_id: str,
+        server_id: str,
+        media: tuple[str, str, str],
+    ) -> None:
+        now = time.monotonic()
+        self._prune_recent_media_caches(now)
+        path, mime_type, filename = media
+        if thread_id and sender_id and mime_type.startswith("image/"):
+            bucket = self.recent_sender_media.setdefault((thread_id, sender_id), [])
+            bucket.append((now, path, mime_type, filename))
+            if len(bucket) > 3:
+                del bucket[:-3]
+        if thread_id and server_id:
+            self.recent_server_media[(thread_id, server_id)] = (
+                now,
+                path,
+                mime_type,
+                filename,
+            )
+
+    def _get_cached_media_by_server_id(
+        self, thread_id: str, server_id: str
+    ) -> tuple[str, str, str] | None:
+        if not thread_id or not server_id:
+            return None
+        self._prune_recent_media_caches()
+        entry = self.recent_server_media.get((thread_id, server_id))
+        if entry is None:
+            return None
+        _, path, mime_type, filename = entry
+        for s_key, items in list(self.recent_sender_media.items()):
+            if s_key[0] != thread_id:
+                continue
+            filtered = [item for item in items if item[1] != path]
+            if filtered:
+                self.recent_sender_media[s_key] = filtered
+            else:
+                self.recent_sender_media.pop(s_key, None)
+        return path, mime_type, filename
+
+    def _pop_recent_sender_media(
+        self, thread_id: str, sender_id: str, max_age_seconds: float = 90.0
+    ) -> tuple[str, str, str] | None:
+        if not thread_id or not sender_id:
+            return None
+        now = time.monotonic()
+        self._prune_recent_media_caches(now)
+        bucket = self.recent_sender_media.get((thread_id, sender_id))
+        if not bucket:
+            return None
+        ts, path, mime_type, filename = bucket.pop()
+        if not bucket:
+            self.recent_sender_media.pop((thread_id, sender_id), None)
+        if now - ts > max_age_seconds:
+            return None
+        return path, mime_type, filename
+
     async def _download_v1_media(
         self,
         *,
@@ -1284,21 +1449,45 @@ class AgentWeChatPlatformAdapter(Platform):
         message_id: str,
         msg_type: int,
     ) -> tuple[str, str, str] | None:
-        try:
-            downloaded = await asyncio.to_thread(
-                self.client.download_message_media,
-                message_id,
-                msg_type=msg_type,
-                quality="best",
-                wait_seconds=MEDIA_WAIT_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            logger.warning(
-                f"[agent_wechat] v1 media download failed for {thread_id} ({message_id}): {exc}"
-            )
-            return None
+        # 商店/自定义表情 (type=47) 若 CDN 域名不在 agent-wechat 白名单会固定返回 500 operation_failed，仅重试 1 次
+        retry_delays = (0.5,) if msg_type == MSG_TYPE_STICKER else (0.5, 1.0, 2.0)
+        downloaded: tuple[bytes, str, str] | None = None
+        last_exc: Exception | None = None
+
+        for attempt in range(len(retry_delays) + 1):
+            try:
+                downloaded = await asyncio.to_thread(
+                    self.client.download_message_media,
+                    message_id,
+                    msg_type=msg_type,
+                    quality="best",
+                    wait_seconds=MEDIA_WAIT_TIMEOUT_SECONDS,
+                )
+                if downloaded is not None:
+                    break
+            except AgentWeChatAPIError as exc:
+                last_exc = exc
+                if exc.status_code in {404, 410} and exc.code in {
+                    "message_recalled",
+                    "not_found",
+                }:
+                    break
+            except Exception as exc:
+                last_exc = exc
+
+            if attempt < len(retry_delays):
+                await asyncio.sleep(retry_delays[attempt])
 
         if downloaded is None:
+            if msg_type == MSG_TYPE_STICKER and isinstance(last_exc, AgentWeChatAPIError) and last_exc.status_code == 500:
+                logger.info(
+                    f"[agent_wechat] 商店/加密表情暂不支持拉取原图，已降级为文本占位 chat={thread_id} id={message_id}"
+                )
+            else:
+                logger.warning(
+                    f"[agent_wechat] v1 media download unavailable chat={thread_id} "
+                    f"id={message_id} type={msg_type} err={last_exc}"
+                )
             return None
 
         raw_bytes, mime_type, filename = downloaded

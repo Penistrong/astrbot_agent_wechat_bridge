@@ -157,3 +157,41 @@ def test_download_message_media_handles_transfer_and_wxgf_preview(monkeypatch) -
     assert calls["transfer"] == 1
     assert calls["content"] == ["original", "preview"]
 
+
+def test_download_message_media_falls_back_to_direct_image_when_assets_unavailable(
+    monkeypatch,
+) -> None:
+    client = WeChatClient(
+        "http://127.0.0.1:6174",
+        token="secret",
+        account_id="acct_main",
+    )
+    monkeypatch.setattr(
+        client,
+        "list_message_media",
+        lambda message_id, account_id=None: [
+            {"id": "asset_orig", "state": "failed", "variant": "original"},
+        ],
+    )
+    monkeypatch.setattr(
+        client,
+        "start_media_transfer",
+        lambda message_id, quality="best", asset_id=None, account_id=None: {
+            "id": "job_1",
+            "state": "failed",
+        },
+    )
+    monkeypatch.setattr(
+        client,
+        "get_message_image",
+        lambda message_id, *, quality="best", account_id=None, timeout=30.0: (
+            b"cached_jpg",
+            "image/jpeg",
+            "image_best.jpg",
+        ),
+    )
+
+    downloaded = client.download_message_media("msg_img_fallback", msg_type=3)
+    assert downloaded == (b"cached_jpg", "image/jpeg", "image_best.jpg")
+
+

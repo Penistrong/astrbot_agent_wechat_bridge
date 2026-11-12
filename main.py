@@ -44,7 +44,7 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
     "astrbot_agent_wechat_bridge",
     "Penistrong",
     "AstrBot platform adapter for agent-wechat (1.x Native /v1 API).",
-    "1.0.2",
+    "1.0.3",
 )
 class AgentWeChatBridgePlugin(Star):
     """加载平台适配器并提供远程登录与状态管理命令。"""
@@ -150,7 +150,7 @@ class AgentWeChatBridgePlugin(Star):
                 try:
                     await pm.reload(platform_cfg)
                     logger.info(
-                        f"[agent_wechat] 已随插件热重载同步重启平台适配器: id={platform_cfg.get('id')} (v1.0.2)"
+                        f"[agent_wechat] 已随插件热重载同步重启平台适配器: id={platform_cfg.get('id')} (v1.0.3)"
                     )
                 except Exception as exc:
                     logger.warning(

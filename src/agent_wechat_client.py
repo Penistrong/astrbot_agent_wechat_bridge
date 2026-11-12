@@ -897,6 +897,41 @@ class WeChatClient:
                     return asset
         return available[0]
 
+    def get_message_image(
+        self,
+        message_id: str,
+        *,
+        quality: str = "best",
+        account_id: str | None = None,
+        timeout: float | None = 30.0,
+    ) -> tuple[bytes, str, str] | None:
+        """通过 /v1/accounts/{a}/messages/{id}/image 直接从 Profile 缓存读取图片。"""
+        mid = encode_resource_id(message_id)
+        qs = self._qs({"quality": quality})
+        path = self._account_path(f"/messages/{mid}/image{qs}", account_id)
+        response = self._session().get(
+            f"{self.base_url}{path}",
+            headers=self._build_headers(json_body=False),
+            timeout=self.timeout if timeout is None else timeout,
+            verify=self.verify_tls,
+        )
+        if not response.ok:
+            if response.status_code in {404, 409, 410}:
+                return None
+            self._raise_api_error(response)
+        if not response.content:
+            return None
+        content_type = (
+            (response.headers.get("content-type") or "image/jpeg")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        ext = mimetypes.guess_extension(content_type) or ".jpg"
+        if content_type == "image/jpeg":
+            ext = ".jpg"
+        return response.content, content_type, f"image_{quality}{ext}"
+
     def download_message_media(
         self,
         message_id: str,
@@ -906,7 +941,7 @@ class WeChatClient:
         wait_seconds: float = 20.0,
         account_id: str | None = None,
     ) -> tuple[bytes, str, str] | None:
-        """下载消息关联的媒体资源（自动发起按需传输并处理 WXGF 预览图）。"""
+        """下载消息关联的媒体资源（自动发起按需传输、多画质降级并处理 WXGF 预览图）。"""
         acct = account_id or self.resolve_account_id()
         assets = self.list_message_media(message_id, account_id=acct)
         asset = self._select_available_asset(assets, msg_type, quality)
@@ -921,6 +956,8 @@ class WeChatClient:
                     "recalled",
                     "expired",
                     "unsupported",
+                    "failed",
+                    "cancelled",
                 }:
                     in_flight_job_id = str(item["jobId"])
                     break
@@ -936,19 +973,71 @@ class WeChatClient:
                     for item in assets
                 )
                 if not has_terminal_unavailable:
-                    job = self.start_media_transfer(
-                        message_id,
-                        quality=transfer_quality,
-                        account_id=acct,
-                    )
-                    self.wait_media_job(
-                        job, timeout_seconds=wait_seconds, account_id=acct
-                    )
+                    try:
+                        job = self.start_media_transfer(
+                            message_id,
+                            quality=transfer_quality,
+                            account_id=acct,
+                        )
+                        self.wait_media_job(
+                            job, timeout_seconds=wait_seconds, account_id=acct
+                        )
+                    except AgentWeChatAPIError:
+                        if quality != "best":
+                            raise
 
             assets = self.list_message_media(message_id, account_id=acct)
             asset = self._select_available_asset(assets, msg_type, quality)
 
+            # 若首选画质（例如未上传原图的 original）传输失败或未就绪，按序尝试降级画质（standard -> thumbnail）
+            if asset is None and quality == "best" and assets:
+                for fallback_variant in ("standard", "normal", "thumbnail"):
+                    candidate = next(
+                        (
+                            a
+                            for a in assets
+                            if a.get("variant") == fallback_variant
+                            and a.get("state")
+                            not in {"expired", "unsupported", "recalled", "failed"}
+                        ),
+                        None,
+                    )
+                    if candidate is None:
+                        continue
+                    try:
+                        job = self.start_media_transfer(
+                            message_id,
+                            quality=fallback_variant,
+                            asset_id=str(candidate["id"])
+                            if candidate.get("id")
+                            else None,
+                            account_id=acct,
+                        )
+                        self.wait_media_job(
+                            job,
+                            timeout_seconds=min(10.0, wait_seconds),
+                            account_id=acct,
+                        )
+                        assets = self.list_message_media(message_id, account_id=acct)
+                        asset = self._select_available_asset(assets, msg_type, quality)
+                        if asset is not None:
+                            break
+                    except Exception:
+                        continue
+
         if asset is None or not asset.get("id"):
+            if msg_type == 3:
+                for fallback_q in ("best", "standard", "thumbnail"):
+                    try:
+                        direct_img = self.get_message_image(
+                            message_id,
+                            quality=fallback_q,
+                            account_id=acct,
+                        )
+                        if direct_img is not None:
+                            return direct_img
+                    except Exception:
+                        continue
             return None
 
         asset_id = str(asset["id"])
