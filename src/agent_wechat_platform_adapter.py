@@ -79,6 +79,8 @@ MEDIA_TYPES = {
 POLL_INTERVAL_MS = 1000
 EVENT_SYNC_INTERVAL_MS = 3000
 AUTH_POLL_INTERVAL_MS = 30000
+AUTO_RELOGIN_COOLDOWN_SECONDS = 300.0
+AUTO_RELOGIN_WAIT_SECONDS = 15.0
 LOGIN_PAGE_WARN_INTERVAL_SECONDS = 60.0
 HOT_PATH_TIMEOUT_SECONDS = 10.0
 MEDIA_WAIT_TIMEOUT_SECONDS = 25.0
@@ -366,6 +368,8 @@ class AgentWeChatPlatformAdapter(Platform):
         self.last_auth_check = 0.0
         self.last_auth_status: str | None = None
         self.last_login_page_warn_at = 0.0
+        self._last_auto_relogin_at = 0.0
+        self._auto_relogin_inflight = False
         self.suppress_inbound_during_relogin = False
         self.self_id = "agent_wechat"
         self.self_aliases: set[str] = set()
@@ -923,6 +927,12 @@ class AgentWeChatPlatformAdapter(Platform):
                 with suppress(Exception):
                     await asyncio.to_thread(self.client.connect)
             if self.last_auth_status == "logged_out":
+                # 微信会周期性推送 auth_required（serviceCode=-13）并本地登出。
+                # 先尝试已保存设备信任的自动登录；失败再提示扫码，避免每 3 天
+                # 必须人工 /wxauth 一次。
+                if await self._attempt_auto_relogin():
+                    self.last_auth_check = 0.0
+                    return True
                 self._warn_login_page_throttled()
             return False
 
@@ -934,6 +944,59 @@ class AgentWeChatPlatformAdapter(Platform):
 
         self.last_login_page_warn_at = 0.0
         return True
+
+    async def _attempt_auto_relogin(self) -> bool:
+        """Try saved-device login after a server-side auth_required.
+
+        WeChat invalidates this kind of session every few days with
+        serviceCode=-13; the saved device trust normally still works, so a
+        headless login succeeds without a QR scan. Only fall back to the
+        manual /wxauth warning when that attempt does not complete.
+        """
+        now = time.monotonic()
+        if self._auto_relogin_inflight:
+            return False
+        if now - self._last_auto_relogin_at < AUTO_RELOGIN_COOLDOWN_SECONDS:
+            return False
+        self._auto_relogin_inflight = True
+        self._last_auto_relogin_at = now
+        op_id = ""
+        try:
+            op = await asyncio.to_thread(
+                self.client.start_login,
+                strategy="auto",
+                allow_qr=True,
+                force_qr=False,
+                timeout_seconds=120,
+            )
+            op_id = str(op.get("id") or "").strip()
+            if not op_id:
+                logger.warning("[agent_wechat] 自动重新登录未返回 operation id")
+                return False
+            deadline = time.monotonic() + AUTO_RELOGIN_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                state = str(op.get("state") or "")
+                if state == "succeeded":
+                    logger.info("[agent_wechat] 已通过保存的设备信任自动恢复登录")
+                    self.__class__.reset_logout_warning_state()
+                    self.last_login_page_warn_at = 0.0
+                    return True
+                if state in {"failed", "cancelled", "expired", "rejected", "needs_login"}:
+                    logger.warning(f"[agent_wechat] 自动重新登录结束 state={state}，需要人工 /wxauth")
+                    return False
+                await asyncio.sleep(1.5)
+                op = await asyncio.to_thread(self.client.get_operation, op_id)
+            state = str(op.get("state") or "")
+            logger.warning(f"[agent_wechat] 自动重新登录等待超时 state={state}，需要人工 /wxauth")
+            if state in {"starting", "awaiting_scan", "awaiting_approval", "authenticating"}:
+                with suppress(Exception):
+                    await asyncio.to_thread(self.client.cancel_operation, op_id)
+            return False
+        except Exception as exc:
+            logger.warning(f"[agent_wechat] 自动重新登录失败: {exc}")
+            return False
+        finally:
+            self._auto_relogin_inflight = False
 
     async def _rebaseline_event_cursor(self) -> None:
         """首次启动或游标过期时，将事件游标对齐到当前最新边界，避免回灌历史消息。"""
