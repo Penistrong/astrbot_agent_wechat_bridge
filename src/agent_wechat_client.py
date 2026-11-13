@@ -1514,7 +1514,9 @@ class WeChatEventStreamClient:
                 event_type = ""
                 event_cursor = ""
 
-                for raw_line in response.iter_lines(decode_unicode=False):
+                for raw_line in response.iter_lines(
+                    chunk_size=1, decode_unicode=False
+                ):
                     if stop_event.is_set():
                         break
                     if raw_line is None:

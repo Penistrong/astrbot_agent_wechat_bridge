@@ -176,6 +176,29 @@ DEFAULT_CONFIG = {
 }
 
 
+def _parse_bool(
+    value: Any,
+    default: bool = False,
+    *,
+    legacy_str_as_false: bool = False,
+) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        if legacy_str_as_false:
+            # Vuetify <v-switch> 将非布尔类型的字符串（包括 "true"）一律渲染为关闭状态 (false)
+            return False
+        norm = value.strip().lower()
+        if norm in {"1", "true", "yes", "on"}:
+            return True
+        if norm in {"0", "false", "no", "off", ""}:
+            return False
+        return default
+    return bool(value)
+
+
 def _parse_timestamp(value: str | int | float | None) -> int:
     if value is None or value == "":
         return int(time.time())
@@ -297,6 +320,20 @@ class AgentWeChatPlatformAdapter(Platform):
 
         self.settings = platform_settings
         self.config = {**DEFAULT_CONFIG, **(platform_config or {})}
+        # 修正旧版本文本输入框遗留的字符串布尔值（Vuetify v-switch 对字符串一律显示为关闭）
+        self.config["verify_tls"] = _parse_bool(
+            self.config.get("verify_tls"), default=False
+        )
+        self.config["require_group_mention"] = _parse_bool(
+            self.config.get("require_group_mention"),
+            default=False,
+            legacy_str_as_false=True,
+        )
+        if isinstance(platform_config, dict):
+            platform_config["verify_tls"] = self.config["verify_tls"]
+            platform_config["require_group_mention"] = self.config[
+                "require_group_mention"
+            ]
         self.metadata = PlatformMetadata(
             name="agent_wechat",
             description="WeChat adapter powered by agent-wechat (1.x Native API).",
@@ -304,7 +341,7 @@ class AgentWeChatPlatformAdapter(Platform):
             support_streaming_message=False,
         )
         account_id_cfg = str(self.config.get("account_id") or "").strip() or None
-        verify_tls_cfg = bool(self.config.get("verify_tls", False))
+        verify_tls_cfg = bool(self.config["verify_tls"])
         self.client = WeChatClient(
             base_url=str(self.config["server_url"]),
             token=str(self.config.get("token") or "") or None,
@@ -542,7 +579,8 @@ class AgentWeChatPlatformAdapter(Platform):
                     prev_ws.cancel()
 
         logger.info(
-            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.3"
+            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.4 "
+            f"require_group_mention={self.config.get('require_group_mention')}"
         )
         await self._refresh_auth_if_needed()
         self.ws_task = asyncio.create_task(self._run_events_stream())
@@ -567,9 +605,9 @@ class AgentWeChatPlatformAdapter(Platform):
                         continue
 
                     now_ms = time.time() * 1000
-                    should_poll = event_triggered or (
-                        not self.ws_connected
-                        and (now_ms - self.last_full_sync_ms) >= EVENT_SYNC_INTERVAL_MS
+                    should_poll = (
+                        event_triggered
+                        or (now_ms - self.last_full_sync_ms) >= EVENT_SYNC_INTERVAL_MS
                     )
                     if should_poll:
                         await self._sync_events_once()
@@ -1127,7 +1165,11 @@ class AgentWeChatPlatformAdapter(Platform):
                 )
             )
 
-        require_mention = bool(self.config.get("require_group_mention", False))
+        require_mention = _parse_bool(
+            self.config.get("require_group_mention", False),
+            default=False,
+            legacy_str_as_false=True,
+        )
         dm_policy = str(self.config.get("dm_policy") or "open")
         dm_allowlist = normalize_allowlist(self.config.get("dm_allowlist"))
         group_policy = str(self.config.get("group_policy") or "open")

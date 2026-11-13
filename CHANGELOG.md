@@ -2,6 +2,13 @@
 
 本项目遵循“每次版本更新都记录变更”的约定。
 
+## 1.0.4 - 2026-11-13
+
+- **修复旧配置字符串 `"true"` 导致 WebUI 开关显示关闭但后端实际拦截未 `@` 群消息的问题**：
+  - 修复 `require_group_mention` 在 `config.json` 中遗留为字符串 `"true"` 时，Vuetify `<v-switch>` 因严格全等判断渲染为关闭（灰色），而 Python `bool("true")` 计算为 `True` 导致普通群消息被静默丢弃的问题；启动及热重载时自动清洗持久化为真实布尔值
+  - 优化 SSE 实时性与反代缓冲兜底：`response.iter_lines(chunk_size=1)` 禁用 `requests` 默认 512 字节行缓冲，并恢复定时增量游标对账轮询（配合 `event_lock` 与前置去重零重复），防止 SSE 连接半开或缓冲时消息延迟到达
+  - 修复 `logout_notify_umos` 填写裸 `wxid` 时报错 `not enough values to unpack (expected 3, got 1)` 的问题，自动补全为 `agent_wechat:FriendMessage:wxid` 格式
+
 ## 1.0.3 - 2026-11-11
 
 - **修复群聊图片多模态识别缺失、媒体延迟重试与表情降级问题**：
