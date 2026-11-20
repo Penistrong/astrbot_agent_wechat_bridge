@@ -152,6 +152,10 @@ ssh -N -L 6174:127.0.0.1:6174 user@<服务器B地址>
 | `dm_allowlist` | `[]` | 私聊白名单 `wxid` 列表 |
 | `group_policy` | `open` | 群聊策略：`open` / `allowlist` / `disabled` |
 | `group_allowlist` | `[]` | 群聊白名单（支持填群 ID `xxx@chatroom` 或发言人 `wxid`） |
+| `ensure_group_sender_identity` | `true` | 当对应配置文件未开启 AstrBot「用户识别」时，自动为微信群聊补充当前发言人昵称与 ID，避免张冠李戴 |
+| `logout_notify_umos` | `[]` | 微信掉线跨平台提醒会话列表（支持在机器人接入设置页面可视化选择 QQ / Telegram / 飞书等其他在线平台的 UMO） |
+| `logout_notify_max_count` | `3` | 单次掉线期间最多发送几次提醒（`0` 为不限制，重连后自动清零） |
+| `logout_notify_interval_seconds` | `900` | 两次掉线提醒之间的最小间隔秒数 |
 
 ---
 

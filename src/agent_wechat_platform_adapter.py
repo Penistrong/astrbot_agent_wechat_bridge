@@ -16,6 +16,8 @@ from typing import Any, Awaitable, Callable, cast
 from astrbot.api import logger
 from astrbot.api.message_components import (
     At,
+    AtAll,
+    Face,
     File,
     Image,
     Location,
@@ -43,6 +45,7 @@ from .agent_wechat_access import (
     normalize_allowlist,
     should_forward_message,
     strip_leading_mentions,
+    strip_leading_self_mentions,
 )
 from .agent_wechat_client import (
     AgentWeChatAPIError,
@@ -141,6 +144,27 @@ CONFIG_METADATA = {
         "type": "list",
         "hint": "当群聊策略为 allowlist 时生效，可填写群 ID (xxx@chatroom) 或发送者 wxid。",
     },
+    "ensure_group_sender_identity": {
+        "description": "群聊自动补齐发言人身份信息",
+        "type": "bool",
+        "hint": "当对应配置文件未开启 AstrBot「用户识别 (identifier)」时，自动为微信群聊消息注入当前发言人昵称与 ID，避免多人混聊或主动回复时张冠李戴。",
+    },
+    "logout_notify_umos": {
+        "description": "退出登录跨平台提醒 (logout_notify_umos)",
+        "type": "list",
+        "_special": "umo",
+        "hint": "选择或填写其他在线平台（如 QQ / Telegram / 飞书等）的会话 UMO（例如 SnowLuma:FriendMessage:QQ号）。微信掉线时无法通过离线的微信自身发消息，请勿选择当前微信平台的会话。",
+    },
+    "logout_notify_max_count": {
+        "description": "退出登录提醒最大发送次数",
+        "type": "int",
+        "hint": "单次掉线期间最多发送几次提醒（默认 3 次，0 表示不限制，重连成功后自动重置）。",
+    },
+    "logout_notify_interval_seconds": {
+        "description": "退出登录提醒发送间隔 (秒)",
+        "type": "float",
+        "hint": "两次掉线提醒之间的最小间隔秒数（默认 900 秒）。",
+    },
 }
 
 I18N_RESOURCES = {
@@ -173,6 +197,10 @@ DEFAULT_CONFIG = {
     "dm_allowlist": [],
     "group_policy": "open",
     "group_allowlist": [],
+    "ensure_group_sender_identity": True,
+    "logout_notify_umos": [],
+    "logout_notify_max_count": 3,
+    "logout_notify_interval_seconds": 900,
 }
 
 
@@ -305,6 +333,9 @@ class AgentWeChatPlatformAdapter(Platform):
     def reset_logout_warning_state(cls) -> None:
         cls._logout_warn_sent_count = 0
         cls._logout_warn_limit_logged = False
+        for inst in list(cls._active_instances):
+            inst.logout_warn_sent_count = 0
+            inst.logout_warn_limit_logged = False
 
     def __init__(
         self,
@@ -319,6 +350,9 @@ class AgentWeChatPlatformAdapter(Platform):
             self.config = platform_config
 
         self.settings = platform_settings
+        self._raw_platform_config = (
+            platform_config if isinstance(platform_config, dict) else {}
+        )
         self.config = {**DEFAULT_CONFIG, **(platform_config or {})}
         # 修正旧版本文本输入框遗留的字符串布尔值（Vuetify v-switch 对字符串一律显示为关闭）
         self.config["verify_tls"] = _parse_bool(
@@ -329,10 +363,17 @@ class AgentWeChatPlatformAdapter(Platform):
             default=False,
             legacy_str_as_false=True,
         )
+        self.config["ensure_group_sender_identity"] = _parse_bool(
+            self.config.get("ensure_group_sender_identity"),
+            default=True,
+        )
         if isinstance(platform_config, dict):
             platform_config["verify_tls"] = self.config["verify_tls"]
             platform_config["require_group_mention"] = self.config[
                 "require_group_mention"
+            ]
+            platform_config["ensure_group_sender_identity"] = self.config[
+                "ensure_group_sender_identity"
             ]
         self.metadata = PlatformMetadata(
             name="agent_wechat",
@@ -361,13 +402,17 @@ class AgentWeChatPlatformAdapter(Platform):
         self.thread_cache: dict[str, dict[str, Any]] = {}
         self.contact_cache: dict[str, dict[str, Any]] = {}
         self.group_member_cache: dict[str, dict[str, str]] = {}
+        self.group_member_miss_cache: set[tuple[str, str]] = set()
         self.recent_sender_media: dict[tuple[str, str], list[tuple[float, str, str, str]]] = {}
         self.recent_server_media: dict[tuple[str, str], tuple[float, str, str, str]] = {}
         self.last_auth_check = 0.0
         self.last_auth_status: str | None = None
         self.last_login_page_warn_at = 0.0
+        self.logout_warn_sent_count = 0
+        self.logout_warn_limit_logged = False
         self.suppress_inbound_during_relogin = False
         self.self_id = "agent_wechat"
+        self.self_display_name: str = ""
         self.self_aliases: set[str] = set()
         self._add_self_alias(self.self_id)
         self._add_self_alias(self.config.get("id"))
@@ -512,20 +557,38 @@ class AgentWeChatPlatformAdapter(Platform):
         if len(self.active_chat_ids) > 16:
             del self.active_chat_ids[16:]
 
+    def _get_effective_logout_interval_seconds(self) -> float:
+        if "logout_notify_interval_seconds" in self._raw_platform_config:
+            try:
+                return max(
+                    1.0, float(self._raw_platform_config["logout_notify_interval_seconds"])
+                )
+            except (TypeError, ValueError):
+                pass
+        return self.__class__._logout_warn_interval_seconds
+
+    def _get_effective_logout_max_count(self) -> int:
+        if "logout_notify_max_count" in self._raw_platform_config:
+            try:
+                return max(0, int(self._raw_platform_config["logout_notify_max_count"]))
+            except (TypeError, ValueError):
+                pass
+        return self.__class__._logout_warn_max_count
+
     def _warn_login_page_throttled(self) -> None:
         now = time.monotonic()
-        interval_seconds = self.__class__._logout_warn_interval_seconds
+        interval_seconds = self._get_effective_logout_interval_seconds()
         if now - self.last_login_page_warn_at < interval_seconds:
             return
 
-        max_count = self.__class__._logout_warn_max_count
-        if max_count > 0 and self.__class__._logout_warn_sent_count >= max_count:
-            if not self.__class__._logout_warn_limit_logged:
+        max_count = self._get_effective_logout_max_count()
+        if max_count > 0 and self.logout_warn_sent_count >= max_count:
+            if not self.logout_warn_limit_logged:
                 logger.warning(
                     "[agent_wechat] 退出登录提醒已达到最大发送数量，"
                     f"max_count={max_count}，等待重新登录后重置"
                 )
-                self.__class__._logout_warn_limit_logged = True
+                self.logout_warn_limit_logged = True
             return
 
         self.last_login_page_warn_at = now
@@ -541,9 +604,13 @@ class AgentWeChatPlatformAdapter(Platform):
             return
 
         try:
-            maybe_result = notifier(warn_text)
+            try:
+                maybe_result = notifier(warn_text, self)  # type: ignore[call-arg]
+            except TypeError:
+                maybe_result = notifier(warn_text)
             if asyncio.iscoroutine(maybe_result):
                 asyncio.create_task(maybe_result)
+            self.logout_warn_sent_count += 1
             self.__class__._logout_warn_sent_count += 1
         except Exception as exc:
             logger.warning(f"[agent_wechat] 退出登录提醒回调失败: {exc}")
@@ -579,7 +646,7 @@ class AgentWeChatPlatformAdapter(Platform):
                     prev_ws.cancel()
 
         logger.info(
-            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.4 "
+            f"[agent_wechat] adapter started id={self.metadata.id} version=1.0.5 "
             f"require_group_mention={self.config.get('require_group_mention')}"
         )
         await self._refresh_auth_if_needed()
@@ -916,6 +983,12 @@ class AgentWeChatPlatformAdapter(Platform):
             self._add_self_alias(self.self_id)
         if auth.get("alias"):
             self._add_self_alias(str(auth["alias"]))
+        for name_key in ("displayName", "nickname", "name"):
+            val = str(auth.get(name_key) or "").strip()
+            if val:
+                self.self_display_name = val
+                self._add_self_alias(val)
+                break
 
         if self.last_auth_status != "logged_in":
             # 若已认证但处于 disconnected，尝试自动唤醒连接
@@ -927,6 +1000,8 @@ class AgentWeChatPlatformAdapter(Platform):
             return False
 
         if prev_status != "logged_in":
+            self.logout_warn_sent_count = 0
+            self.logout_warn_limit_logged = False
             self.__class__.reset_logout_warning_state()
             self._load_persisted_state()
             if self.event_cursor == "0":
@@ -1024,6 +1099,48 @@ class AgentWeChatPlatformAdapter(Platform):
             pass
         return {"id": thread_id, "peerId": thread_id}
 
+    async def _ensure_group_member_cache(self, thread_id: str) -> dict[str, str]:
+        room_members = self.group_member_cache.get(thread_id)
+        if room_members is not None:
+            return room_members
+
+        room_members = {}
+        cursor: str | None = None
+        for _ in range(3):
+            page: dict[str, Any] | None = None
+            with suppress(Exception):
+                if cursor is None:
+                    page = await asyncio.to_thread(
+                        self.client.list_group_members, thread_id, 200
+                    )
+                else:
+                    page = await asyncio.to_thread(
+                        self.client.list_group_members, thread_id, 200, cursor
+                    )
+            if not isinstance(page, dict):
+                break
+            items = page.get("items") or []
+            for item in items:
+                if isinstance(item, dict) and not item.get("deleted"):
+                    uid = str(item.get("username") or item.get("id") or "")
+                    label = str(
+                        item.get("roomDisplayName")
+                        or item.get("displayName")
+                        or item.get("mentionName")
+                        or ""
+                    ).strip()
+                    if uid and label:
+                        room_members[uid] = label
+            next_cursor = str(page.get("nextCursor") or "").strip()
+            if not next_cursor or not items or len(items) < 200:
+                break
+            cursor = next_cursor
+
+        self.group_member_cache[thread_id] = room_members
+        if self.self_id in room_members and room_members[self.self_id]:
+            self._add_self_alias(room_members[self.self_id])
+        return room_members
+
     async def _resolve_sender_display_name(
         self,
         thread_id: str,
@@ -1034,27 +1151,31 @@ class AgentWeChatPlatformAdapter(Platform):
             return "WeChat"
 
         if is_group:
-            room_members = self.group_member_cache.get(thread_id)
-            if room_members is None:
-                room_members = {}
-                with suppress(Exception):
-                    page = await asyncio.to_thread(
-                        self.client.list_group_members, thread_id, 200
-                    )
-                    for item in (page or {}).get("items") or []:
-                        if isinstance(item, dict) and not item.get("deleted"):
-                            uid = str(item.get("username") or item.get("id") or "")
-                            label = str(
-                                item.get("roomDisplayName")
-                                or item.get("displayName")
-                                or item.get("mentionName")
-                                or ""
-                            ).strip()
-                            if uid and label:
-                                room_members[uid] = label
-                self.group_member_cache[thread_id] = room_members
+            room_members = await self._ensure_group_member_cache(thread_id)
             if sender_id in room_members:
                 return room_members[sender_id]
+            if (
+                (thread_id, sender_id) not in self.group_member_miss_cache
+                and hasattr(self.client, "get_group_member")
+            ):
+                fetched_member: dict[str, Any] | None = None
+                with suppress(Exception):
+                    fetched_member = await asyncio.to_thread(
+                        self.client.get_group_member, thread_id, sender_id
+                    )
+                if isinstance(fetched_member, dict) and not fetched_member.get("deleted"):
+                    label = str(
+                        fetched_member.get("roomDisplayName")
+                        or fetched_member.get("displayName")
+                        or fetched_member.get("mentionName")
+                        or ""
+                    ).strip()
+                    if label:
+                        room_members[sender_id] = label
+                        if sender_id == self.self_id:
+                            self._add_self_alias(label)
+                        return label
+                self.group_member_miss_cache.add((thread_id, sender_id))
 
         contact = self.contact_cache.get(sender_id)
         if contact is None:
@@ -1070,9 +1191,34 @@ class AgentWeChatPlatformAdapter(Platform):
                 or contact.get("nickname")
             )
             if name:
-                return str(name)
+                name_str = str(name)
+                if sender_id == self.self_id:
+                    self.self_display_name = name_str
+                    self._add_self_alias(name_str)
+                return name_str
 
         return sender_id
+
+    async def _resolve_self_display_name(
+        self,
+        thread_id: str,
+        is_group: bool,
+    ) -> str:
+        if is_group:
+            room_members = await self._ensure_group_member_cache(thread_id)
+            if self.self_id in room_members and room_members[self.self_id]:
+                return room_members[self.self_id]
+        if self.self_display_name:
+            return self.self_display_name
+        if self.self_id and self.self_id != "agent_wechat":
+            resolved = await self._resolve_sender_display_name(
+                thread_id, self.self_id, is_group
+            )
+            if resolved and resolved != self.self_id:
+                self.self_display_name = resolved
+                self._add_self_alias(resolved)
+                return resolved
+        return self.self_display_name or self.self_id
 
     async def _convert_native_message(
         self,
@@ -1141,6 +1287,8 @@ class AgentWeChatPlatformAdapter(Platform):
             if isinstance(message.get("mentions"), dict)
             else None
         )
+        if is_group and thread_id not in self.group_member_cache:
+            await self._ensure_group_member_cache(thread_id)
         was_mentioned = is_native_mentioned(mentions_obj, raw_text, self.self_aliases)
 
         # 微信的「引用」不会带 at，但引用机器人自己的消息就是在对机器人说话。
@@ -1242,8 +1390,43 @@ class AgentWeChatPlatformAdapter(Platform):
                     )
             return None
 
+        sender_name = await self._resolve_sender_display_name(
+            thread_id, sender_id, is_group
+        )
+        bot_display_name = (
+            await self._resolve_self_display_name(thread_id, is_group)
+            if is_group
+            else (self.self_display_name or self.self_id)
+        )
+
+        other_mentioned_ids: list[str] = []
+        mention_all = False
+        if is_group and isinstance(mentions_obj, dict):
+            mention_all = mentions_obj.get("all") is True
+            self_norm_set = {
+                self._normalize_alias(item).casefold()
+                for item in (self.self_aliases | {self.self_id, "self"})
+                if item
+            }
+            for raw_uid in mentions_obj.get("userIds") or []:
+                uid = str(raw_uid or "").strip()
+                if not uid or uid == "notify@all":
+                    continue
+                if self._normalize_alias(uid).casefold() in self_norm_set:
+                    continue
+                if uid not in other_mentioned_ids:
+                    other_mentioned_ids.append(uid)
+
         normalized_text = (
-            strip_leading_mentions(raw_text) if is_group else raw_text.strip()
+            strip_leading_self_mentions(
+                raw_text,
+                self.self_aliases,
+                strip_first_if_unmatched=bool(
+                    was_mentioned and not other_mentioned_ids and not mention_all
+                ),
+            )
+            if is_group
+            else raw_text.strip()
         )
 
         components: list[Any] = []
@@ -1251,7 +1434,7 @@ class AgentWeChatPlatformAdapter(Platform):
 
         # 引用回复 (49/57 或携带 quote 对象)
         if isinstance(quote, dict) and quote.get("state") != "recalled":
-            q_sender = str(quote.get("senderId") or "unknown")
+            q_sender = str(quote.get("senderId") or "unknown").strip() or "unknown"
             q_text = str(quote.get("embeddedText") or "").strip()
             q_srv_id = str(quote.get("serverId") or "")
             q_type = int(quote.get("type") or 0)
@@ -1263,22 +1446,50 @@ class AgentWeChatPlatformAdapter(Platform):
                 else ""
             )
             if q_display:
+                if quoted_self:
+                    q_sender_id = self.self_id
+                    q_sender_name = bot_display_name or self.self_display_name or self.self_id
+                elif q_sender != "unknown":
+                    q_sender_id = q_sender
+                    q_sender_name = await self._resolve_sender_display_name(
+                        thread_id, q_sender, is_group
+                    )
+                else:
+                    q_sender_id = "unknown"
+                    q_sender_name = "unknown"
+
                 components.append(
                     Reply(
                         id=q_srv_id or message_id,
                         chain=[Plain(text=q_display)],
-                        sender_id=self.self_id if quoted_self else q_sender,
-                        sender_nickname=q_sender,
+                        sender_id=q_sender_id,
+                        sender_nickname=q_sender_name,
                         message_str=q_display,
                         text=q_display,
                     )
                 )
-                message_str_parts.append(f"[引用 {q_sender}: {q_display[:120]}]")
 
-        # 只有真的被 @ 或引用机器人自己的消息时才注入 At。require_mention=False 的语义是
-        # 「把群消息放行到框架」（让群聊上下文与主动回复能看到消息），不是「把每条消息都当成在叫机器人」。
-        if is_group and (was_mentioned or quoted_self):
-            components.append(At(qq=self.self_id, name="bot"))
+        # 只有真的被 @ 或引用机器人自己的消息时才注入唤醒机器人的 At。
+        # 同时将对其他群成员的 @提及还原为独立 At 组件（供 GroupChatContext 区分说话对象）。
+        extra_other_mention_texts: list[str] = []
+        if is_group:
+            if mention_all:
+                components.append(AtAll(name="全体成员"))
+            elif was_mentioned or quoted_self:
+                components.append(
+                    At(qq=self.self_id, name=bot_display_name or "bot")
+                )
+            for other_uid in other_mentioned_ids:
+                other_name = await self._resolve_sender_display_name(
+                    thread_id, other_uid, True
+                )
+                components.append(At(qq=other_uid, name=other_name))
+                if (
+                    other_name
+                    and f"@{other_name}".lower() not in normalized_text.lower()
+                    and f"＠{other_name}".lower() not in normalized_text.lower()
+                ):
+                    extra_other_mention_texts.append(f"@{other_name}")
 
         # 位置消息 (48)
         location = message.get("location")
@@ -1305,9 +1516,13 @@ class AgentWeChatPlatformAdapter(Platform):
             )
             components.append(Plain(text=link_summary))
             message_str_parts.append(link_summary)
-        elif normalized_text:
-            components.append(Plain(text=normalized_text))
-            message_str_parts.append(normalized_text)
+        elif normalized_text or extra_other_mention_texts:
+            combined_text = " ".join(
+                part for part in [*extra_other_mention_texts, normalized_text] if part
+            ).strip()
+            if combined_text:
+                components.append(Plain(text=combined_text))
+                message_str_parts.append(combined_text)
 
         # 下载媒体附件（含直接媒体消息，以及引用了图片/表情的回复消息）
         media: tuple[str, str, str] | None = None
@@ -1353,27 +1568,30 @@ class AgentWeChatPlatformAdapter(Platform):
                 else:
                     message_str_parts.append(f"[file:{filename}]")
         elif is_direct_media_msg and not normalized_text:
-            # 媒体下载失败时保留占位文本，避免整条消息因 components 为空而凭空消失
-            placeholder = (
-                "[表情]"
-                if (msg_type == MSG_TYPE_STICKER or app_msg_type == 8)
-                else "[图片]"
-                if msg_type == MSG_TYPE_IMAGE
-                else "[语音]"
-                if msg_type == MSG_TYPE_VOICE
-                else "[视频]"
-                if msg_type == MSG_TYPE_VIDEO
-                else "[文件]"
-            )
-            components.append(Plain(text=placeholder))
-            message_str_parts.append(placeholder)
+            is_sticker_msg = msg_type == MSG_TYPE_STICKER or app_msg_type == 8
+            if is_group and is_sticker_msg and not (was_mentioned or quoted_self):
+                # 群聊中未 @机器人 的加密商店表情无法下载原图时，转为 Face 组件而非 Plain("[表情]")，
+                # 避免 AstrBot 主动回复对纯占位符抽签回复“嗯”并污染对话历史。
+                components.append(Face(id=0))
+            else:
+                # 私聊或明确向机器人提问的媒体下载失败时保留占位文本，避免整条消息凭空消失
+                placeholder = (
+                    "[表情]"
+                    if is_sticker_msg
+                    else "[图片]"
+                    if msg_type == MSG_TYPE_IMAGE
+                    else "[语音]"
+                    if msg_type == MSG_TYPE_VOICE
+                    else "[视频]"
+                    if msg_type == MSG_TYPE_VIDEO
+                    else "[文件]"
+                )
+                components.append(Plain(text=placeholder))
+                message_str_parts.append(placeholder)
 
         if not components:
             return None
 
-        sender_name = await self._resolve_sender_display_name(
-            thread_id, sender_id, is_group
-        )
         abm = AstrBotMessage()
         abm.self_id = self.self_id
         abm.sender = MessageMember(user_id=sender_id, nickname=sender_name)

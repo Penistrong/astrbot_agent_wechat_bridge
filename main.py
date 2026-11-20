@@ -15,7 +15,14 @@ from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.platform import MessageType
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, register
+
+try:
+    from astrbot.core.agent.message import TextPart
+except ImportError:
+    TextPart = None  # type: ignore[assignment]
 
 PLUGIN_ROOT = Path(__file__).resolve().parent
 if str(PLUGIN_ROOT) not in sys.path:
@@ -44,7 +51,7 @@ AgentWeChatPlatformAdapter = _AgentWeChatPlatformAdapter
     "astrbot_agent_wechat_bridge",
     "Penistrong",
     "AstrBot platform adapter for agent-wechat (1.x Native /v1 API).",
-    "1.0.4",
+    "1.0.5",
 )
 class AgentWeChatBridgePlugin(Star):
     """加载平台适配器并提供远程登录与状态管理命令。"""
@@ -58,16 +65,10 @@ class AgentWeChatBridgePlugin(Star):
             max_count=self._get_logout_notify_max_count(),
         )
 
-    def _get_logout_notify_umos(self) -> list[str]:
-        raw = self.config.get("logout_notify_umos", [])
+    @staticmethod
+    def _extract_valid_umos(raw: object) -> list[str]:
         if not isinstance(raw, list):
             return []
-        adapter = AgentWeChatPlatformAdapter.get_active_instance()
-        platform_id = (
-            adapter.meta().id
-            if adapter is not None and hasattr(adapter, "meta")
-            else "agent_wechat"
-        )
         umos: list[str] = []
         for item in raw:
             if not isinstance(item, str):
@@ -75,28 +76,53 @@ class AgentWeChatBridgePlugin(Star):
             value = item.strip()
             if not value:
                 continue
-            if ":" not in value:
-                msg_type = (
-                    "GroupMessage" if value.endswith("@chatroom") else "FriendMessage"
+            parts = value.split(":")
+            if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+                logger.warning(
+                    f"[agent_wechat] 退出登录提醒配置项 {value!r} 不是合法的三段式 UMO"
+                    "（正确示例: SnowLuma:FriendMessage:123456），已忽略；"
+                    "请在机器人接入设置或插件配置中选择其他在线平台（如 QQ / Telegram / 飞书）的会话 UMO。"
                 )
-                value = f"{platform_id}:{msg_type}:{value}"
-            umos.append(value)
+                continue
+            if value not in umos:
+                umos.append(value)
         return umos
 
+    def _get_logout_notify_umos(self, adapter: object | None = None) -> list[str]:
+        merged: list[str] = []
+        candidates: list[object] = []
+        if adapter is not None:
+            candidates.append(adapter)
+        else:
+            candidates.extend(
+                list(getattr(AgentWeChatPlatformAdapter, "_active_instances", []) or [])
+            )
+        for inst in candidates:
+            inst_cfg = getattr(inst, "config", None)
+            if isinstance(inst_cfg, dict):
+                for umo in self._extract_valid_umos(inst_cfg.get("logout_notify_umos")):
+                    if umo not in merged:
+                        merged.append(umo)
+
+        for umo in self._extract_valid_umos(self.config.get("logout_notify_umos", [])):
+            if umo not in merged:
+                merged.append(umo)
+        return merged
+
     def _get_logout_notify_max_count(self) -> int:
-        raw = self.config.get("logout_notify_max_count", 0)
+        raw = self.config.get("logout_notify_max_count", 3)
         try:
             value = int(raw)
         except (TypeError, ValueError):
-            return 0
+            return 3
         return max(0, value)
 
     def _get_logout_notify_interval_seconds(self) -> float:
-        raw = self.config.get("logout_notify_interval_seconds", 60)
+        raw = self.config.get("logout_notify_interval_seconds", 900)
         try:
             value = float(raw)
         except (TypeError, ValueError):
-            return 60.0
+            return 900.0
         return max(1.0, value)
 
     def _resolve_active_client(self) -> WeChatClient | None:
@@ -105,24 +131,53 @@ class AgentWeChatBridgePlugin(Star):
             return adapter.get_client()
         return None
 
-    async def _broadcast_chain(self, chain: MessageChain) -> int:
-        umos = self._get_logout_notify_umos()
+    def _get_offline_wechat_platform_ids(self) -> set[str]:
+        offline_ids: set[str] = set()
+        for inst in list(getattr(AgentWeChatPlatformAdapter, "_active_instances", []) or []):
+            try:
+                pid = str(inst.meta().id or "")
+                if pid and getattr(inst, "last_auth_status", None) != "logged_in":
+                    offline_ids.add(pid)
+            except Exception:
+                pass
+        return offline_ids
+
+    async def _broadcast_chain(
+        self,
+        chain: MessageChain,
+        *,
+        exclude_umo: str | None = None,
+        adapter: object | None = None,
+    ) -> int:
+        umos = self._get_logout_notify_umos(adapter=adapter)
         if not umos:
             return 0
 
+        offline_wechat_ids = self._get_offline_wechat_platform_ids()
         sent = 0
         for umo in umos:
+            if exclude_umo and umo == exclude_umo:
+                continue
+            target_platform_id = umo.split(":", 1)[0].strip()
+            if target_platform_id in offline_wechat_ids:
+                logger.warning(
+                    f"[agent_wechat] 退出登录提醒目标 {umo} 属于当前已离线的微信平台 ({target_platform_id})，"
+                    "无法通过离线微信向自身发送提醒；请改填其他在线平台（如 QQ / Telegram / 飞书）的会话 UMO。"
+                )
+                continue
             try:
                 ok = await self.context.send_message(umo, chain)
                 if ok:
                     sent += 1
                 else:
-                    logger.warning(f"[agent_wechat] UMO 发送失败: {umo}")
+                    logger.warning(f"[agent_wechat] UMO 发送失败（未找到对应在线平台）: {umo}")
             except Exception as exc:
                 logger.warning(f"[agent_wechat] UMO 发送异常: umo={umo} err={exc}")
         return sent
 
-    async def _notify_logout(self, warn_text: str) -> None:
+    async def _notify_logout(
+        self, warn_text: str, adapter: object | None = None
+    ) -> None:
         _ = warn_text
         AgentWeChatPlatformAdapter.set_logout_notify_policy(
             interval_seconds=self._get_logout_notify_interval_seconds(),
@@ -131,7 +186,7 @@ class AgentWeChatBridgePlugin(Star):
         chain = MessageChain().message(
             "[agent-wechat] 微信账号当前未登录或已断开连接，请发送 /wxauth 获取远程登录二维码。"
         )
-        await self._broadcast_chain(chain)
+        await self._broadcast_chain(chain, adapter=adapter)
 
     async def initialize(self) -> None:
         """当插件在运行期被更新或热重载时，自动修正配置布尔类型并重启 PlatformManager 中的 agent_wechat 实例。"""
@@ -139,6 +194,9 @@ class AgentWeChatBridgePlugin(Star):
         if pm is None:
             return
 
+        legacy_plugin_umos = self._extract_valid_umos(
+            self.config.get("logout_notify_umos", [])
+        )
         config_dirty = False
         for platform_cfg in list(getattr(pm, "platforms_config", []) or []):
             if not isinstance(platform_cfg, dict):
@@ -150,6 +208,25 @@ class AgentWeChatBridgePlugin(Star):
                 if not isinstance(platform_cfg.get("verify_tls"), bool):
                     raw_tls = str(platform_cfg.get("verify_tls") or "").strip().lower()
                     platform_cfg["verify_tls"] = raw_tls in {"1", "true", "yes", "on"}
+                    config_dirty = True
+                if (
+                    "ensure_group_sender_identity" in platform_cfg
+                    and not isinstance(platform_cfg.get("ensure_group_sender_identity"), bool)
+                ):
+                    raw_gid = (
+                        str(platform_cfg.get("ensure_group_sender_identity") or "")
+                        .strip()
+                        .lower()
+                    )
+                    platform_cfg["ensure_group_sender_identity"] = raw_gid not in {
+                        "0",
+                        "false",
+                        "no",
+                        "off",
+                    }
+                    config_dirty = True
+                if legacy_plugin_umos and not platform_cfg.get("logout_notify_umos"):
+                    platform_cfg["logout_notify_umos"] = list(legacy_plugin_umos)
                     config_dirty = True
         if config_dirty:
             try:
@@ -183,7 +260,7 @@ class AgentWeChatBridgePlugin(Star):
                 try:
                     await pm.reload(platform_cfg)
                     logger.info(
-                        f"[agent_wechat] 已随插件热重载同步重启平台适配器: id={platform_cfg.get('id')} (v1.0.4)"
+                        f"[agent_wechat] 已随插件热重载同步重启平台适配器: id={platform_cfg.get('id')} (v1.0.5)"
                     )
                 except Exception as exc:
                     logger.warning(
@@ -207,6 +284,83 @@ class AgentWeChatBridgePlugin(Star):
                         ws_task.cancel()
             except Exception:
                 pass
+
+    def _should_ensure_group_sender_identity(
+        self, event: AstrMessageEvent | None = None
+    ) -> bool:
+        target_pid = ""
+        if event is not None and hasattr(event, "get_platform_id"):
+            with_pid = event.get_platform_id()
+            if with_pid:
+                target_pid = str(with_pid)
+        for inst in list(getattr(AgentWeChatPlatformAdapter, "_active_instances", []) or []):
+            try:
+                pid = str(inst.meta().id or "")
+                raw_cfg = getattr(inst, "_raw_platform_config", None)
+                if (not target_pid or pid == target_pid) and isinstance(raw_cfg, dict):
+                    if "ensure_group_sender_identity" in raw_cfg:
+                        val = raw_cfg["ensure_group_sender_identity"]
+                        if isinstance(val, bool):
+                            return val
+                        if isinstance(val, str):
+                            return val.strip().lower() not in {"0", "false", "no", "off"}
+                        return bool(val)
+            except Exception:
+                pass
+
+        raw = self.config.get("ensure_group_sender_identity", True)
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            return raw.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(raw)
+
+    @filter.on_llm_request()
+    async def inject_group_sender_identity(
+        self,
+        event: AstrMessageEvent,
+        req: ProviderRequest,
+    ) -> None:
+        """当 AstrBot 对应配置文件未开启 identifier（用户识别）时，自动为微信群聊补齐当前发言人身份。"""
+        if event.get_platform_name() != "agent_wechat":
+            return
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+        if not self._should_ensure_group_sender_identity(event):
+            return
+
+        try:
+            umo_cfg = self.context.get_config(umo=event.unified_msg_origin) or {}
+            if umo_cfg.get("provider_settings", {}).get("identifier"):
+                return
+        except Exception:
+            pass
+
+        extra_parts = getattr(req, "extra_user_content_parts", None)
+        if not isinstance(extra_parts, list):
+            return
+
+        for part in extra_parts:
+            part_text = (
+                part.get("text", "")
+                if isinstance(part, dict)
+                else str(getattr(part, "text", "") or "")
+            )
+            if "User ID:" in part_text and "Nickname:" in part_text:
+                return
+
+        sender_id = str(event.get_sender_id() or "").strip()
+        sender_name = str(event.get_sender_name() or sender_id).strip()
+        if not sender_id and not sender_name:
+            return
+
+        reminder_text = (
+            f"<system_reminder>User ID: {sender_id}, Nickname: {sender_name}</system_reminder>"
+        )
+        if TextPart is not None:
+            extra_parts.append(TextPart(text=reminder_text))
+        else:
+            extra_parts.append({"type": "text", "text": reminder_text})
 
     @filter.command("wxstatus")
     async def wxstatus(self, event: AstrMessageEvent):
@@ -291,7 +445,9 @@ class AgentWeChatBridgePlugin(Star):
             .message("[agent-wechat] 微信远程登录二维码，请使用手机微信扫码确认：")
             .file_image(qr_path)
         )
-        sent_count = await self._broadcast_chain(chain)
+        sent_count = await self._broadcast_chain(
+            chain, exclude_umo=event.unified_msg_origin
+        )
         if sent_count > 0:
             yield event.plain_result(
                 f"同时已将登录二维码推送到 {sent_count} 个提醒会话。"

@@ -2,6 +2,20 @@
 
 本项目遵循“每次版本更新都记录变更”的约定。
 
+## 1.0.5 - 2026-11-20
+
+- **修复群聊回复“张冠李戴”（发言人身份缺失、引用人裸 `wxid`、`@其他群友` 丢失）及表情引用报错问题**：
+  - **群聊发言人身份自动兜底 (`ensure_group_sender_identity`)**：AstrBot 默认关闭「用户识别 (`provider_settings.identifier = false`)」时，多人群聊共享会话下当前触发消息不会携带发言人昵称，导致大模型将当前发言误判为群聊上下文中上一位发言的群友。现插件新增 `on_llm_request` 自动兜底注入 `<system_reminder>User ID: ..., Nickname: ...</system_reminder>`（若对应配置已开启 AstrBot 原生「用户识别」则自动跳过不重复注入）
+  - **引用消息 (`Reply`) 发送者昵称解析**：修复群聊/私聊引用消息中 `Reply.sender_nickname` 直接使用裸 `wxid_...`（含引用机器人自身消息时显示裸 `wxid`）的问题，现统一解析为群名片/备注/昵称，并移除 `message_str` 中冗余的裸 `wxid` 引用前缀
+  - **群聊 `@其他群友` 保留与 `At` 组件还原**：新增 `strip_leading_self_mentions`，仅剥离指向机器人自身的句首 `@提及`，完整保留对其他群成员的 `@提及` 并还原 `At(qq=..., name=...)` / `AtAll` 组件；修复纯 `@机器人` 空提及时残留 `@昵称` 文本的问题
+  - **群成员缓存分页与单成员补查**：群成员列表支持自动分页预热，并在缓存未命中时通过 `/groups/{id}/members/{uid}` 按需补查新入群或大群成员昵称
+  - **修复引用表情/不支持引用类型消息报 `HTTP 400 (unsupported_quote_type)`**：出站文本携带引用遇到 `unsupported_quote_type` / `invalid_quote` / `message_recalled` 时自动剥离引用降级为普通文本发送；同时将群聊未 `@机器人` 且无法拉取原图的加密商店表情降级为 `Face` 组件而非 `Plain("[表情]")`，避免随机主动回复对纯表情占位符反复回“嗯”并污染对话历史
+- **优化跨平台掉线提醒 (`logout_notify_umos`) 校验与可视化选择体验**：
+  - 将 `logout_notify_umos`、`logout_notify_max_count`、`logout_notify_interval_seconds` 及 `ensure_group_sender_identity` 直接挂载到 **「机器人 -> `agent_wechat` -> 接入设置」** 面板（同时向下兼容「插件 -> 配置」入口并自动迁移旧配置），无需再跨页面去插件列表里找配置
+  - 为 `logout_notify_umos` 启用 AstrBot 原生 `"_special": "umo"` 可视化会话选择器，并明确提示需选择其他在线平台（如 QQ / Telegram / 飞书）的会话 UMO
+  - 移除对裸 `wxid` 自动拼接 `agent_wechat:` 前缀的逻辑；当检测到 `logout_notify_umos` 指向当前已离线的 `agent_wechat` 平台或格式不完整时，直接拦截跳过并输出清晰的配置修正指引，避免向已掉线的微信平台发消息触发 `HTTP 409 (auth_required)`
+  - 执行 `/wxauth` 广播登录二维码时自动排除当前发起指令的会话 UMO，避免同一聊天窗口重复收到两张二维码
+
 ## 1.0.4 - 2026-11-13
 
 - **修复旧配置字符串 `"true"` 导致 WebUI 开关显示关闭但后端实际拦截未 `@` 群消息的问题**：

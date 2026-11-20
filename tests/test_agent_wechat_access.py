@@ -9,6 +9,7 @@ from src.agent_wechat_access import (
     normalize_wechat_id,
     should_forward_message,
     strip_leading_mentions,
+    strip_leading_self_mentions,
 )
 
 
@@ -28,6 +29,33 @@ def test_normalize_allowlist_deduplicates() -> None:
 def test_strip_leading_mentions() -> None:
     text = "@Bot\u2005@Alice\u2005 hello there"
     assert strip_leading_mentions(text) == "hello there"
+
+
+def test_strip_leading_self_mentions_preserves_other_member_mentions() -> None:
+    assert (
+        strip_leading_self_mentions("@C\u2005送我", {"乌萨奇", "wxid_bot"})
+        == "@C 送我"
+    )
+    assert (
+        strip_leading_self_mentions("@乌萨奇\u2005@C\u2005送我", {"乌萨奇", "wxid_bot"})
+        == "@C 送我"
+    )
+    assert strip_leading_self_mentions("@乌萨奇\u2005", {"乌萨奇"}) == ""
+    assert (
+        strip_leading_self_mentions(
+            "@未知群名片\u2005你好",
+            {"wxid_bot"},
+            strip_first_if_unmatched=True,
+        )
+        == "你好"
+    )
+    assert (
+        strip_leading_self_mentions(
+            "@The Bot\u2005hello world",
+            {"The Bot"},
+        )
+        == "hello world"
+    )
 
 
 def test_extract_leading_mentions() -> None:

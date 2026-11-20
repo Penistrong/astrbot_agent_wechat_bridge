@@ -57,6 +57,77 @@ def strip_leading_mentions(text: str) -> str:
     return cleaned
 
 
+def strip_leading_self_mentions(
+    text: str,
+    aliases: list[str] | set[str] | tuple[str, ...],
+    *,
+    strip_first_if_unmatched: bool = False,
+) -> str:
+    """仅移除消息开头指向机器人自身的 @提及，保留对其他群成员的 @提及。
+
+    当整条消息仅包含对机器人的 @提及（空 @）时返回空字符串 ``""``。
+    """
+
+    cleaned = INVISIBLE_TEXT_RE.sub("", text or "").strip()
+    if not cleaned:
+        return ""
+
+    raw_aliases = sorted(
+        {
+            INVISIBLE_TEXT_RE.sub("", str(item)).strip().lstrip("@＠").strip()
+            for item in (aliases or ())
+            if item and str(item).strip().lstrip("@＠").strip()
+        },
+        key=len,
+        reverse=True,
+    )
+    normalized_aliases = {
+        _normalize_mention_target(item) for item in raw_aliases if item
+    }
+    normalized_aliases.discard("")
+
+    remaining = cleaned
+    stripped_any = False
+
+    while remaining.startswith(("@", "＠")):
+        body = remaining[1:]
+        matched_len = 0
+        for alias in raw_aliases:
+            if body.lower().startswith(alias.lower()):
+                end_pos = len(alias)
+                if end_pos == len(body) or body[end_pos] in ("\u2005", " ", "\t", "\n", "\r"):
+                    matched_len = end_pos
+                    break
+
+        if matched_len > 0:
+            remaining = body[matched_len:].lstrip("\u2005 \t\r\n")
+            stripped_any = True
+            continue
+
+        # 按分隔符拆分首个 @token 再比对归一化别名
+        token_match = re.match(r"^[@＠]([^\u2005\s]+)(?:[\u2005\s]+(.*))?$", remaining, re.DOTALL)
+        if token_match:
+            target_norm = _normalize_mention_target(token_match.group(1))
+            if target_norm and target_norm in normalized_aliases:
+                remaining = (token_match.group(2) or "").lstrip("\u2005 \t\r\n")
+                stripped_any = True
+                continue
+
+        break
+
+    if not stripped_any and strip_first_if_unmatched and remaining.startswith(("@", "＠")):
+        # 已知 mentions.self=True 且未提及其他群成员，但机器人群名片尚未进入 aliases 缓存
+        u2005_match = re.match(r"^[@＠][^\u2005]+\u2005(.*)$", remaining, re.DOTALL)
+        if u2005_match:
+            remaining = u2005_match.group(1).lstrip("\u2005 \t\r\n")
+        else:
+            ws_match = re.match(r"^[@＠]\S+(?:\s+(.*))?$", remaining, re.DOTALL)
+            if ws_match:
+                remaining = (ws_match.group(1) or "").lstrip("\u2005 \t\r\n")
+
+    return remaining.replace("\u2005", " ").strip()
+
+
 def _normalize_mention_target(raw: str | None) -> str:
     if not raw:
         return ""

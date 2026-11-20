@@ -1,8 +1,9 @@
 {
   "logout_notify_umos": {
     "type": "list",
-    "description": "退出登录提醒",
-    "hint": "UMO列表，/sid获取，列表组件（配置后向UMO列表发消息）",
+    "_special": "umo",
+    "description": "退出登录跨平台提醒 (UMO 列表)",
+    "hint": "提示：该项现已同步支持直接在「机器人 -> agent_wechat -> 接入设置」中可视化选择会话。此处作为插件级全局兜底配置；请填写或选择其他在线平台（如 QQ / Telegram / 飞书等）的会话 UMO（例如 SnowLuma:FriendMessage:QQ号，可通过 /sid 获取）。",
     "default": []
   },
   "logout_notify_max_count": {
@@ -15,5 +16,11 @@
     "description": "发送间隔时间",
     "hint": "单位秒",
     "default": 900
+  },
+  "ensure_group_sender_identity": {
+    "type": "bool",
+    "description": "群聊自动补齐发言人身份信息",
+    "hint": "当对应配置文件未开启 AstrBot「用户识别 (identifier)」时，自动为微信群聊消息注入当前发言人昵称与 ID，避免多人混聊或主动回复时张冠李戴（若已开启原生「用户识别」则自动跳过，不会重复注入）。",
+    "default": true
   }
 }

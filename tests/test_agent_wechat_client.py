@@ -1,4 +1,8 @@
-from src.agent_wechat_client import WeChatClient, encode_resource_id
+from src.agent_wechat_client import (
+    AgentWeChatAPIError,
+    WeChatClient,
+    encode_resource_id,
+)
 
 
 def test_encode_resource_id_escapes_slashes() -> None:
@@ -193,5 +197,40 @@ def test_download_message_media_falls_back_to_direct_image_when_assets_unavailab
 
     downloaded = client.download_message_media("msg_img_fallback", msg_type=3)
     assert downloaded == (b"cached_jpg", "image/jpeg", "image_best.jpg")
+
+
+def test_send_text_falls_back_to_plain_text_on_unsupported_quote_type(
+    monkeypatch,
+) -> None:
+    client = WeChatClient(
+        "http://127.0.0.1:6174",
+        token="secret",
+        account_id="acct_main",
+    )
+    posted_bodies: list[dict] = []
+
+    def fake_post(path, json_body=None, *, headers=None, timeout=None):
+        posted_bodies.append(dict(json_body or {}))
+        if json_body and "quote" in json_body:
+            raise AgentWeChatAPIError(
+                'HTTP 400 (unsupported_quote_type): {"error":{"code":"unsupported_quote_type"}}',
+                status_code=400,
+                code="unsupported_quote_type",
+            )
+        return {"id": "send_plain_1", "state": "sent"}
+
+    monkeypatch.setattr(client, "_post", fake_post)
+
+    result = client.send_text(
+        "43278484028@chatroom",
+        "嗯",
+        quote={"messageId": "msg_sticker_1", "serverId": "10099"},
+    )
+    assert result["success"] is True
+    assert len(posted_bodies) == 2
+    assert "quote" in posted_bodies[0]
+    assert "quote" not in posted_bodies[1]
+    assert posted_bodies[1]["text"] == "嗯"
+
 
 

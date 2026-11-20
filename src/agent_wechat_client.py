@@ -669,6 +669,31 @@ class WeChatClient:
         result = self._get(self._account_path(f"/groups/{rid}/members{qs}", account_id))
         return result if isinstance(result, dict) else {"items": [], "nextCursor": None}
 
+    def get_group_member(
+        self,
+        room_id: str,
+        username: str,
+        account_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        rid = encode_resource_id(room_id)
+        uid = encode_resource_id(username)
+        try:
+            result = self._get(
+                self._account_path(f"/groups/{rid}/members/{uid}", account_id)
+            )
+        except AgentWeChatAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+        if not isinstance(result, dict):
+            return None
+        member = result.get("member")
+        if isinstance(member, dict):
+            return member
+        if result.get("username") or result.get("id"):
+            return result
+        return None
+
     # ------------------------------------------------------------------
     # Events & Cursor Management
     # ------------------------------------------------------------------
@@ -1209,6 +1234,24 @@ class WeChatClient:
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
             intent = self.get_send_by_key(key, account_id=acct, timeout=10.0)
         except AgentWeChatAPIError as exc:
+            err_code = str(exc.code or "").strip().lower()
+            if quote and (
+                err_code
+                in {
+                    "unsupported_quote_type",
+                    "invalid_quote",
+                    "quote_not_found",
+                    "message_recalled",
+                    "not_found",
+                }
+                or (exc.status_code == 400 and "quote" in err_code)
+            ):
+                return self.send_text(
+                    thread_id,
+                    text,
+                    account_id=acct,
+                    timeout=timeout,
+                )
             if exc.status_code is not None and exc.status_code >= 500:
                 try:
                     intent = self.get_send_by_key(key, account_id=acct, timeout=10.0)
@@ -1227,6 +1270,18 @@ class WeChatClient:
         if state in SUCCESS_SEND_STATES:
             return {"success": True, **intent}
         error_code = str(intent.get("errorCode") or state or "send_failed")
+        if quote and error_code.lower() in {
+            "unsupported_quote_type",
+            "invalid_quote",
+            "quote_not_found",
+            "message_recalled",
+        }:
+            return self.send_text(
+                thread_id,
+                text,
+                account_id=acct,
+                timeout=timeout,
+            )
         return {"success": False, "error": error_code, **intent}
 
     def send_share(
